@@ -23,6 +23,7 @@
 // ----------------------------------------------------------------------------
 
 #include "main.h"
+#include <string.h>
 #include "cprotocol.h"
 #include "cclients.h"
 #include "creflector.h"
@@ -35,7 +36,9 @@
 CProtocol::CProtocol()
 {
     m_bStopThread = false;
+    m_bStopTxThread = false;
     m_pThread = NULL;
+    m_pTxThread = NULL;
     m_Streams.reserve(NB_OF_MODULES);
 }
 
@@ -45,7 +48,7 @@ CProtocol::CProtocol()
 
 CProtocol::~CProtocol()
 {
-    // kill threads
+    // kill RX thread
     m_bStopThread = true;
     if ( m_pThread != NULL )
     {
@@ -53,10 +56,20 @@ CProtocol::~CProtocol()
         delete m_pThread;
     }
 
-    // empty queue
+    // kill TX thread
+    m_bStopTxThread = true;
+    m_QueueCondVar.notify_one();
+    if ( m_pTxThread != NULL )
+    {
+        m_pTxThread->join();
+        delete m_pTxThread;
+    }
+
+    // empty queue — delete any remaining packets to prevent leak on shutdown
     m_Queue.Lock();
     while ( !m_Queue.empty() )
     {
+        delete m_Queue.front();
         m_Queue.pop();
     }
     m_Queue.Unlock();
@@ -70,11 +83,18 @@ bool CProtocol::Init(void)
     // init reflector apparent callsign
     m_ReflectorCallsign = g_Reflector.GetCallsign();
 
-    // reset stop flag
+    // reset stop flags
     m_bStopThread = false;
+    m_bStopTxThread = false;
 
-    // start  thread;
-    m_pThread = new std::thread(CProtocol::Thread, this);
+    // start RX thread (or legacy single thread for unconverted protocols)
+    m_pThread = new std::thread(CProtocol::RxThread, this);
+
+    // start TX thread if protocol uses split-thread mode
+    if ( UsesSplitThreads() )
+    {
+        m_pTxThread = new std::thread(CProtocol::TxThread, this);
+    }
 
     // done
     return true;
@@ -82,6 +102,7 @@ bool CProtocol::Init(void)
 
 void CProtocol::Close(void)
 {
+    // stop RX first — no new data enters the system
     m_bStopThread = true;
     if ( m_pThread != NULL )
     {
@@ -89,18 +110,71 @@ void CProtocol::Close(void)
         delete m_pThread;
         m_pThread = NULL;
     }
+
+    // then stop TX — drain remaining packets and exit
+    m_bStopTxThread = true;
+    m_QueueCondVar.notify_one();
+    if ( m_pTxThread != NULL )
+    {
+        m_pTxThread->join();
+        delete m_pTxThread;
+        m_pTxThread = NULL;
+    }
 }
 
 
 ////////////////////////////////////////////////////////////////////////////////////////
-// thread
+// threads
 
-void CProtocol::Thread(CProtocol *This)
+void CProtocol::RxThread(CProtocol *This)
 {
-    while ( !This->m_bStopThread )
+    if ( This->UsesSplitThreads() )
     {
-        This->Task();
+        while ( !This->m_bStopThread )
+        {
+            This->RxTask();
+        }
     }
+    else
+    {
+        // legacy single-thread mode — run Task() which does both RX and TX
+        while ( !This->m_bStopThread )
+        {
+            This->Task();
+        }
+    }
+}
+
+void CProtocol::TxThread(CProtocol *This)
+{
+    while ( !This->m_bStopTxThread )
+    {
+        This->TxTask();
+    }
+
+    // final drain — process any packets remaining after stop
+    bool drained = false;
+    while ( !drained )
+    {
+        This->HandleQueue();
+        This->m_Queue.Lock();
+        drained = This->m_Queue.empty();
+        This->m_Queue.Unlock();
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// default TX task — condition variable wait + HandleQueue
+
+void CProtocol::TxTask(void)
+{
+    // wait for queue notification or 20ms timeout
+    {
+        std::unique_lock<std::mutex> lk(m_QueueCondMutex);
+        m_QueueCondVar.wait_for(lk, std::chrono::milliseconds(20));
+    }
+
+    HandleQueue();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -140,12 +214,14 @@ void CProtocol::OnDvFramePacketIn(CDvFramePacket *Frame, const CIp *Ip)
     CPacketStream *stream = GetStream(Frame->GetStreamId(), Ip);
     if ( stream == NULL )
     {
-        // std::cout << "Deleting oprhaned Frame Packet with StreamId " << Frame->GetStreamId() << " from " << *Ip << std::endl;
-        delete Frame;
+        // try late entry buffering
+        if ( !g_Reflector.BufferPendingFrame(Frame->GetStreamId(), Frame) )
+        {
+            delete Frame;
+        }
     }
     else
     {
-        //std::cout << "DV frame" << "from "  << *Ip << std::endl;
         // and push
         stream->Lock();
         stream->Push(Frame);
@@ -159,40 +235,49 @@ void CProtocol::OnDvLastFramePacketIn(CDvLastFramePacket *Frame, const CIp *Ip)
     CPacketStream *stream = GetStream(Frame->GetStreamId(), Ip);
     if ( stream == NULL )
     {
-        // std::cout << "Deleting oprhaned Last Frame Packet with StreamId " << Frame->GetStreamId() << " from " << *Ip << std::endl;
-        delete Frame;
+        // check if this is for a promoted late-entry stream
+        stream = g_Reflector.GetPromotedStream(Frame->GetStreamId());
+        if ( stream != NULL )
+        {
+            // handle last frame and close the promoted stream
+            HandleStreamLastFrame(stream, Frame);
+            g_Reflector.CloseStream(stream);
+        }
+        else
+        {
+            // check if pending (not yet promoted) — cancel it
+            g_Reflector.CancelPendingEntry(Frame->GetStreamId());
+            delete Frame;
+        }
     }
     else
     {
-        // push
-        stream->Lock();
-        stream->Push(Frame);
-        stream->Unlock();
-
-        // wait stream queue is empty, same as done in CloseStream(), but we need it before HandleQueue()
-        bool bEmpty = false;
-        do
-        {
-            stream->Lock();
-            // do not use stream->IsEmpty() has this "may" never succeed
-            // and anyway, the DvLastFramPacket short-circuit the transcoder
-            // loop queues
-            bEmpty = stream->empty();
-            stream->Unlock();
-            if ( !bEmpty )
-            {
-                // wait a bit
-                CTimePoint::TaskSleepFor(10);
-            }
-        } while (!bEmpty);
-
-        // handle queue from reflector a bit earlier, before closing the stream,
-        // this avoid last packets to be sent back to transmitting client (master)
-        HandleQueue();
-        
-        // and close the stream
+        HandleStreamLastFrame(stream, Frame);
         g_Reflector.CloseStream(stream);
+
+        // remove from our local stream cache to prevent stale entries
+        // that could cause false Tickle matches on future streams
+        for ( int i = 0; i < m_Streams.size(); i++ )
+        {
+            if ( m_Streams[i] == stream )
+            {
+                m_Streams.erase(m_Streams.begin()+i);
+                break;
+            }
+        }
     }
+}
+
+void CProtocol::HandleStreamLastFrame(CPacketStream *stream, CDvLastFramePacket *Frame)
+{
+    // Push the last frame into the stream for transcoding and routing.
+    // The drain wait is handled by CloseStream (called by the caller after this
+    // returns) to avoid an ABBA deadlock: the drain loop would hold the stream
+    // lock while calling CCodecStream::IsEmpty (which acquires the codec lock),
+    // while the codec thread holds its lock and tries to acquire the stream lock.
+    stream->Lock();
+    stream->Push(Frame);
+    stream->Unlock();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -207,10 +292,17 @@ CPacketStream *CProtocol::GetStream(uint16 uiStreamId, const CIp *Ip)
     {
         if ( m_Streams[i]->GetStreamId() == uiStreamId )
         {
-            // if Ip not NULL, also check if IP match
-            if ( (Ip != NULL) && (m_Streams[i]->GetOwnerIp() != NULL) )
+            // if Ip is NULL, accept any stream with matching streamId
+            // otherwise, also check if IP address matches (ignore port, as some
+            // protocols like NXDN may send packets from different source ports)
+            if ( Ip == NULL )
             {
-                if ( *Ip == *(m_Streams[i]->GetOwnerIp()) )
+                stream = m_Streams[i];
+            }
+            else if ( m_Streams[i]->GetOwnerIp() != NULL )
+            {
+                // Compare only the address part, not the port
+                if ( Ip->GetAddr() == m_Streams[i]->GetOwnerIp()->GetAddr() )
                 {
                     stream = m_Streams[i];
                 }
@@ -234,6 +326,7 @@ void CProtocol::CheckStreamsTimeout(void)
             g_Reflector.CloseStream(m_Streams[i]);
             // and remove it
             m_Streams.erase(m_Streams.begin()+i);
+            i--;
         }
         else
         {
@@ -280,7 +373,11 @@ bool CProtocol::IsSpace(char c) const
 
 char CProtocol::DmrDstIdToModule(uint32 tg) const
 {
-    return ((char)((tg % 26)-1) + 'A');
+    if ( tg >= 1 && tg <= (uint32)NB_OF_MODULES )
+    {
+        return ((char)(tg - 1) + 'A');
+    }
+    return ' ';
 }
 
 uint32 CProtocol::ModuleToDmrDestId(char m) const

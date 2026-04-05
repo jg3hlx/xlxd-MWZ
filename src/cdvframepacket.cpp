@@ -37,6 +37,10 @@ CDvFramePacket::CDvFramePacket()
     ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
     ::memset(m_uiAmbePlus, 0, sizeof(m_uiAmbePlus));
     ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
 };
 
 // dstar constructor
@@ -48,6 +52,10 @@ CDvFramePacket::CDvFramePacket(const struct dstar_dvframe *dvframe, uint16 sid, 
     ::memcpy(m_uiDvData, dvframe->DVDATA, sizeof(m_uiDvData));
     ::memset(m_uiAmbePlus, 0, sizeof(m_uiAmbePlus));
     ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
 }
 
 // dmr constructor
@@ -59,6 +67,10 @@ CDvFramePacket::CDvFramePacket(const uint8 *ambe, const uint8 *sync, uint16 sid,
     ::memcpy(m_uiDvSync, sync, sizeof(m_uiDvSync));
     ::memset(m_uiAmbe, 0, sizeof(m_uiAmbe));
     ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
 }
 
 // ysf constructor
@@ -70,6 +82,10 @@ CDvFramePacket::CDvFramePacket(const uint8 *ambe, uint16 sid, uint8 pid, uint8 s
     ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
     ::memset(m_uiAmbe, 0, sizeof(m_uiAmbe));
     ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
 }
 
 // imrs constructor
@@ -81,6 +97,10 @@ CDvFramePacket::CDvFramePacket(const uint8 *ambe, uint16 sid, uint8 pid, uint8 s
     ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
     ::memset(m_uiAmbe, 0, sizeof(m_uiAmbe));
     ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
 }
 
 // xlx constructor
@@ -95,6 +115,40 @@ CDvFramePacket::CDvFramePacket
     ::memcpy(m_uiDvData, dstardvdata, sizeof(m_uiDvData));
     ::memcpy(m_uiAmbePlus, dmrambe, sizeof(m_uiAmbePlus));
     ::memcpy(m_uiDvSync, dmrsync, sizeof(m_uiDvSync));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
+}
+
+// m17 constructor
+
+CDvFramePacket::CDvFramePacket(const uint8 *codec2, uint16 sid, uint8 pid)
+: CPacket(sid, pid)
+{
+    ::memcpy(m_uiCodec2, codec2, sizeof(m_uiCodec2));
+    m_bHasCodec2 = true;
+    ::memset(m_uiAmbe, 0, sizeof(m_uiAmbe));
+    ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
+    ::memset(m_uiAmbePlus, 0, sizeof(m_uiAmbePlus));
+    ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
+    ::memset(m_uiImbe, 0, sizeof(m_uiImbe));
+    m_bHasImbe = false;
+}
+
+// p25 constructor
+
+CDvFramePacket::CDvFramePacket(uint16 sid, const uint8 *imbe)
+: CPacket(sid, 0xFF)
+{
+    ::memcpy(m_uiImbe, imbe, sizeof(m_uiImbe));
+    m_bHasImbe = true;
+    ::memset(m_uiAmbe, 0, sizeof(m_uiAmbe));
+    ::memset(m_uiDvData, 0, sizeof(m_uiDvData));
+    ::memset(m_uiAmbePlus, 0, sizeof(m_uiAmbePlus));
+    ::memset(m_uiDvSync, 0, sizeof(m_uiDvSync));
+    ::memset(m_uiCodec2, 0, sizeof(m_uiCodec2));
+    m_bHasCodec2 = false;
 }
 
 // copy constructor
@@ -106,6 +160,10 @@ CDvFramePacket::CDvFramePacket(const CDvFramePacket &DvFrame)
     ::memcpy(m_uiDvData, DvFrame.m_uiDvData, sizeof(m_uiDvData));
     ::memcpy(m_uiAmbePlus, DvFrame.m_uiAmbePlus, sizeof(m_uiAmbePlus));
     ::memcpy(m_uiDvSync, DvFrame.m_uiDvSync, sizeof(m_uiDvSync));
+    ::memcpy(m_uiCodec2, DvFrame.m_uiCodec2, sizeof(m_uiCodec2));
+    m_bHasCodec2 = DvFrame.m_bHasCodec2;
+    ::memcpy(m_uiImbe, DvFrame.m_uiImbe, sizeof(m_uiImbe));
+    m_bHasImbe = DvFrame.m_bHasImbe;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -125,6 +183,8 @@ const uint8 *CDvFramePacket::GetAmbe(uint8 uiCodec) const
     {
         case CODEC_AMBEPLUS:    return m_uiAmbe;
         case CODEC_AMBE2PLUS:   return m_uiAmbePlus;
+        case CODEC_CODEC2:      return m_uiCodec2;
+        case CODEC_IMBE:        return m_uiImbe;
         default:                return NULL;
     }
 }
@@ -145,9 +205,23 @@ void CDvFramePacket::SetAmbe(uint8 uiCodec, uint8 *Ambe)
             ::memcpy(m_uiAmbe, Ambe, sizeof(m_uiAmbe));
             break;
         case CODEC_AMBE2PLUS:
-            ::memcpy(m_uiAmbePlus, Ambe, sizeof(m_uiAmbe));
+            ::memcpy(m_uiAmbePlus, Ambe, sizeof(m_uiAmbePlus));
+            break;
+        case CODEC_CODEC2:
+            ::memcpy(m_uiCodec2, Ambe, sizeof(m_uiCodec2));
+            m_bHasCodec2 = true;
+            break;
+        case CODEC_IMBE:
+            ::memcpy(m_uiImbe, Ambe, sizeof(m_uiImbe));
+            m_bHasImbe = true;
             break;
     }
+}
+
+void CDvFramePacket::SetCodec2(const uint8 *codec2)
+{
+    ::memcpy(m_uiCodec2, codec2, sizeof(m_uiCodec2));
+    m_bHasCodec2 = true;
 }
 
 
@@ -159,5 +233,9 @@ bool CDvFramePacket::operator ==(const CDvFramePacket &DvFrame) const
     return ( (::memcmp(m_uiAmbe, DvFrame.m_uiAmbe, sizeof(m_uiAmbe)) == 0) &&
              (::memcmp(m_uiDvData, DvFrame.m_uiDvData, sizeof(m_uiDvData)) == 0) &&
              (::memcmp(m_uiAmbePlus, DvFrame.m_uiAmbePlus, sizeof(m_uiAmbePlus)) == 0) &&
-             (::memcmp(m_uiDvSync, DvFrame.m_uiDvSync, sizeof(m_uiDvSync)) == 0) );
+             (::memcmp(m_uiDvSync, DvFrame.m_uiDvSync, sizeof(m_uiDvSync)) == 0) &&
+             (::memcmp(m_uiCodec2, DvFrame.m_uiCodec2, sizeof(m_uiCodec2)) == 0) &&
+             (m_bHasCodec2 == DvFrame.m_bHasCodec2) &&
+             (::memcmp(m_uiImbe, DvFrame.m_uiImbe, sizeof(m_uiImbe)) == 0) &&
+             (m_bHasImbe == DvFrame.m_bHasImbe) );
 }

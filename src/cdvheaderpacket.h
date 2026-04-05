@@ -96,6 +96,8 @@ public:
     // set callsigns
     void SetRpt2Callsign(const CCallsign &cs)       { m_csRPT2 = cs; }
     void SetRpt2Module(char c)                      { m_csRPT2.SetModule(c); }
+    void SetMySuffix(const char *sz)                { m_csMY.SetSuffix(sz); }
+    bool HasMySuffix(void) const                    { return m_csMY.HasSuffix(); }
     
     // operators
     bool operator ==(const CDvHeaderPacket &) const;

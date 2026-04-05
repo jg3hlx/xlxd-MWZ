@@ -31,6 +31,8 @@
 #include "ctranscoder.h"
 #include "cysfnodedirfile.h"
 #include "cysfnodedirhttp.h"
+#include "cnxdniddirfile.h"
+#include "cnxdniddirhttp.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // constructor
@@ -111,7 +113,10 @@ bool CReflector::Start(void)
     
     // init wiresx node directory
     g_YsfNodeDir.Init();
-    
+
+    // init nxdn id directory
+    g_NxdnIdDir.Init();
+
     // init the transcoder
     g_Transcoder.Init();
     
@@ -190,11 +195,6 @@ void CReflector::Stop(void)
 ////////////////////////////////////////////////////////////////////////////////////////
 // stream opening & closing
 
-bool CReflector::IsStreaming(char module)
-{
-    return false;
-}
-
 CPacketStream *CReflector::OpenStream(CDvHeaderPacket *DvHeader, CClient *client)
 {
     CPacketStream *retStream = NULL;
@@ -225,21 +225,31 @@ CPacketStream *CReflector::OpenStream(CDvHeaderPacket *DvHeader, CClient *client
                         // stream open, mark client as master
                         // so that it can't be deleted
                         client->SetMasterOfModule(module);
-                        
+
                         // update last heard time
                         client->Heard();
                         retStream = stream;
-                        
+
                         // and push header packet
                         stream->Push(DvHeader);
-                        
+
                         // report
-                        std::cout << "Opening stream on module " << module << " for client " << client->GetCallsign()
-                                  << " with sid " << DvHeader->GetStreamId() << std::endl;
-                        
+                        if ( client->IsPeer() )
+                        {
+                            std::cout << "Opening stream on module " << module << " for "
+                                      << DvHeader->GetMyCallsign() << " via " << client->GetCallsign()
+                                      << " with sid " << DvHeader->GetStreamId() << std::endl;
+                        }
+                        else
+                        {
+                            std::cout << "Opening stream on module " << module << " for "
+                                      << DvHeader->GetMyCallsign() << " on " << client->GetCallsign()
+                                      << " with sid " << DvHeader->GetStreamId() << std::endl;
+                        }
+
                         // notify
                         g_Reflector.OnStreamOpen(stream->GetUserCallsign());
-                        
+
                     }
                     // unlock now
                     stream->Unlock();
@@ -263,23 +273,33 @@ void CReflector::CloseStream(CPacketStream *stream)
     //
     if ( stream != NULL )
     {
-        // wait queue is empty
-        // this waits forever
+        // Wait for the transcoder pipeline to drain before closing.
+        // Call IsEmpty() WITHOUT holding the stream lock to avoid ABBA deadlock:
+        // the drain loop would hold stream lock then acquire codec lock (via
+        // CCodecStream::IsEmpty), while CCodecStream::Task() holds codec lock
+        // then acquires stream lock (for jitter buffer release).
+        // The only writer to the stream queue at this point is CCodecStream::Task()
+        // returning transcoded packets — no router traffic since we're at end of
+        // transmission. A momentary read-race on the queue is benign: at worst we
+        // poll one extra 10ms cycle.
+        static const int MAX_DRAIN_WAIT_MS = 2000;  // 2 second max wait
+        static const int DRAIN_POLL_MS = 10;
+        int waitedMs = 0;
         bool bEmpty = false;
         do
         {
-            stream->Lock();
-            // do not use stream->IsEmpty() has this "may" never succeed
-            // and anyway, the DvLastFramPacket short-circuit the transcoder
-            // loop queues
-            bEmpty = stream->empty();
-            stream->Unlock();
-            if ( !bEmpty )
+            bEmpty = stream->IsEmpty();
+            if ( !bEmpty && waitedMs < MAX_DRAIN_WAIT_MS )
             {
-                // wait a bit
-                CTimePoint::TaskSleepFor(10);
+                CTimePoint::TaskSleepFor(DRAIN_POLL_MS);
+                waitedMs += DRAIN_POLL_MS;
             }
-        } while (!bEmpty);
+        } while (!bEmpty && waitedMs < MAX_DRAIN_WAIT_MS);
+
+        if ( !bEmpty )
+        {
+            std::cout << "Warning: CloseStream drain timeout, some transcoded packets may be lost" << std::endl;
+        }
         
         // lock clients
         GetClients();
@@ -289,29 +309,254 @@ void CReflector::CloseStream(CPacketStream *stream)
 
         // get and check the master
         CClient *client = stream->GetOwnerClient();
+        CClient *clientToDisconnect = NULL;
         if ( client != NULL )
         {
+            // report to gatekeeper for loop detection
+            char module = GetStreamModule(stream);
+            bool shouldDisconnect = g_GateKeeper.ReportStreamClose(
+                module,
+                stream->GetUserCallsign(),
+                stream->GetPacketCount(),
+                client->IsPeer()
+            );
+
             // client no longer a master
             client->NotAMaster();
 
             // notify
             g_Reflector.OnStreamClose(stream->GetUserCallsign());
 
-            std::cout << "Closing stream of module " << GetStreamModule(stream) << std::endl;
+            std::cout << "Closing stream of module " << module << std::endl;
+
+            // mark for disconnect after stream is fully closed
+            if ( shouldDisconnect && !client->IsPeer() )
+            {
+                clientToDisconnect = client;
+            }
+
+            // NULL the client pointer now (under stream lock) so no other
+            // thread can dereference it after we release the clients lock.
+            // GetOwnerIp() uses the cached copy set at Open() time.
+            stream->SetOwnerClient(NULL);
         }
 
         // release clients
         ReleaseClients();
-        
+
         // unlock before closing
-        // to avoid double lock in assiociated
+        // to avoid double lock in associated
         // codecstream close/thread-join
         stream->Unlock();
-        
-        // and stop the queue
+
+        // close stream — resets state and releases transcoder stream
         stream->Close();
 
+        // now safe to disconnect the looping client
+        if ( clientToDisconnect != NULL )
+        {
+            GetClients();
+            if ( m_Clients.IsClient(clientToDisconnect) )
+            {
+                std::cout << "Loop detection: removing client " << clientToDisconnect->GetCallsign() << std::endl;
+                m_Clients.RemoveClient(clientToDisconnect);
+            }
+            ReleaseClients();
+        }
 
+        // check for pending late entry on this module
+        int moduleIdx = -1;
+        for ( int i = 0; i < (int)m_Streams.size(); i++ )
+        {
+            if ( &m_Streams[i] == stream )
+            {
+                moduleIdx = i;
+                break;
+            }
+        }
+        if ( moduleIdx >= 0 )
+        {
+            PromotePendingEntry(moduleIdx);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// late entry support
+
+bool CReflector::TryLateEntry(CDvHeaderPacket *DvHeader, CClient *client)
+{
+    // clients MUST be locked by caller
+    char module = DvHeader->GetRpt2Module();
+    int idx = GetModuleIndex(module);
+    if ( idx < 0 )
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_PendingMutex[idx]);
+
+    // only one pending entry per module
+    if ( m_PendingEntries[idx].IsActive() )
+    {
+        return false;
+    }
+
+    // stash it
+    m_PendingEntries[idx].Set(DvHeader, client);
+
+    std::cout << "Late entry: stashed pending on module " << module
+              << " for " << client->GetCallsign()
+              << " with sid " << DvHeader->GetStreamId() << std::endl;
+
+    return true;
+}
+
+bool CReflector::BufferPendingFrame(uint16 streamId, CPacket *frame)
+{
+    for ( int i = 0; i < NB_OF_MODULES; i++ )
+    {
+        std::lock_guard<std::mutex> lock(m_PendingMutex[i]);
+        CPendingEntry &pending = m_PendingEntries[i];
+
+        if ( !pending.IsActive() || pending.GetStreamId() != streamId )
+            continue;
+
+        // check expiry
+        if ( pending.IsExpired() )
+        {
+            std::cout << "Late entry: pending expired on module " << GetModuleLetter(i) << std::endl;
+            pending.Clear();
+            return false;
+        }
+
+        // if promoted, forward directly to stream
+        if ( pending.IsPromoted() )
+        {
+            CPacketStream *stream = pending.GetPromotedStream();
+            stream->Lock();
+            stream->Push(frame);
+            stream->Unlock();
+            return true;
+        }
+
+        // if buffering, try to buffer
+        if ( pending.IsBuffering() )
+        {
+            if ( pending.BufferFrame(frame) )
+            {
+                return true;
+            }
+            // buffer full — BufferFrame already transitioned to HEADER_ONLY
+            std::cout << "Late entry: buffer full on module " << GetModuleLetter(i) << ", switching to pure late entry" << std::endl;
+            return false;
+        }
+
+        // HEADER_ONLY state — just drop the frame
+        return false;
+    }
+
+    return false;
+}
+
+CPacketStream *CReflector::GetPromotedStream(uint16 streamId)
+{
+    for ( int i = 0; i < NB_OF_MODULES; i++ )
+    {
+        std::lock_guard<std::mutex> lock(m_PendingMutex[i]);
+        CPendingEntry &pending = m_PendingEntries[i];
+
+        if ( pending.IsPromoted() && pending.GetStreamId() == streamId )
+        {
+            return pending.GetPromotedStream();
+        }
+    }
+    return NULL;
+}
+
+void CReflector::CancelPendingEntry(uint16 streamId)
+{
+    for ( int i = 0; i < NB_OF_MODULES; i++ )
+    {
+        std::lock_guard<std::mutex> lock(m_PendingMutex[i]);
+        CPendingEntry &pending = m_PendingEntries[i];
+
+        if ( pending.IsActive() && pending.GetStreamId() == streamId )
+        {
+            std::cout << "Late entry: cancelled pending on module " << GetModuleLetter(i) << std::endl;
+            pending.Clear();
+            return;
+        }
+    }
+}
+
+void CReflector::PromotePendingEntry(int moduleIdx)
+{
+    // Lock order: Clients THEN PendingMutex
+    // TryLateEntry acquires Clients (held by caller) then PendingMutex,
+    // so we must use the same order here to prevent ABBA deadlock.
+    GetClients();
+    std::lock_guard<std::mutex> lock(m_PendingMutex[moduleIdx]);
+    CPendingEntry &pending = m_PendingEntries[moduleIdx];
+
+    if ( !pending.IsActive() )
+    {
+        ReleaseClients();
+        return;
+    }
+
+    if ( pending.IsExpired() )
+    {
+        std::cout << "Late entry: pending expired on module " << GetModuleLetter(moduleIdx) << std::endl;
+        pending.Clear();
+        ReleaseClients();
+        return;
+    }
+
+    // re-validate client
+    CClient *client = pending.GetClient();
+
+    if ( !m_Clients.IsClient(client) || client->IsAMaster() )
+    {
+        std::cout << "Late entry: client no longer valid on module " << GetModuleLetter(moduleIdx) << std::endl;
+        pending.Clear();
+        ReleaseClients();
+        return;
+    }
+
+    // try to open the stream
+    CPacketStream *stream = &m_Streams[moduleIdx];
+    stream->Lock();
+    if ( stream->Open(*(pending.GetHeader()), client) )
+    {
+        // mark client as master
+        client->SetMasterOfModule(GetModuleLetter(moduleIdx));
+        client->Heard();
+
+        // push a copy of the header to the stream
+        stream->Push(new CDvHeaderPacket(*(pending.GetHeader())));
+
+        stream->Unlock();
+
+        std::cout << "Late entry: promoted on module " << GetModuleLetter(moduleIdx)
+                  << " for " << client->GetCallsign() << std::endl;
+
+        // notify
+        OnStreamOpen(stream->GetUserCallsign());
+
+        // replay buffered frames
+        pending.ReplayInto(stream);
+
+        // transition to promoted state for ongoing frame forwarding
+        pending.Promote(stream);
+
+        ReleaseClients();
+    }
+    else
+    {
+        // shouldn't happen — we just closed the stream
+        stream->Unlock();
+        std::cout << "Late entry: failed to open stream on module " << GetModuleLetter(moduleIdx) << std::endl;
+        pending.Clear();
+        ReleaseClients();
     }
 }
 
@@ -371,14 +616,29 @@ void CReflector::RouterThread(CReflector *This, CPacketStream *streamIn)
                 queue->push(packetClone);
                 protocol->ReleaseQueue();
             }
+
             // done
             delete packet;
             packet = NULL;
         }
         else
         {
-            // wait a bit
-            CTimePoint::TaskSleepFor(10);
+            // Safety net: if stream is open but expired (no packets for
+            // STREAM_TIMEOUT), close it. This catches promoted late-entry
+            // streams that aren't tracked in any protocol's m_Streams.
+            streamIn->Lock();
+            bool orphaned = streamIn->IsOpen() && streamIn->IsExpired();
+            streamIn->Unlock();
+            if ( orphaned )
+            {
+                std::cout << "Router: closing expired stream on module " << (char)uiModuleId << std::endl;
+                This->CloseStream(streamIn);
+            }
+            else
+            {
+                // wait a bit
+                CTimePoint::TaskSleepFor(10);
+            }
         }
     }
 }
@@ -575,6 +835,24 @@ CPacketStream *CReflector::GetStream(char module)
         stream = &(m_Streams[i]);
     }
     return stream;
+}
+
+void CReflector::ReleaseStreamOwner(CClient *client)
+{
+    // Null out the owner pointer on any stream owned by this client.
+    // Must be called BEFORE deleting the client object to prevent
+    // dangling pointer dereference in CloseStream/RouterThread.
+    // Caller must hold the Clients lock.
+    for ( int i = 0; i < m_Streams.size(); i++ )
+    {
+        m_Streams[i].Lock();
+        if ( m_Streams[i].GetOwnerClient() == client )
+        {
+            client->NotAMaster();
+            m_Streams[i].SetOwnerClient(NULL);
+        }
+        m_Streams[i].Unlock();
+    }
 }
 
 bool CReflector::IsStreamOpen(const CDvHeaderPacket *DvHeader)
@@ -792,9 +1070,6 @@ bool CReflector::UpdateListenMac(void)
             // is it an AF_INET?
             if ( ifaptr->ifa_addr && ifaptr->ifa_addr->sa_family == AF_INET )
             {
-                if (ifaptr->ifa_addr == NULL)
-                    continue;
-                
                 // get the IP
                 if ( getnameinfo(ifaptr->ifa_addr,
                         sizeof(struct sockaddr_in),

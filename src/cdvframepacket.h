@@ -36,6 +36,10 @@
 #define AMBEPLUS_SIZE   9
 #define DVSYNC_SIZE     7
 
+#define CODEC2_SIZE     8   // Codec2 3200bps frame = 8 bytes per 20ms
+
+#define IMBE_SIZE       11  // IMBE 88-bit frame = 11 bytes
+
 // typedef & structures
 
 struct __attribute__ ((__packed__))dstar_dvframe
@@ -58,6 +62,10 @@ public:
     CDvFramePacket(const uint8 *, uint16, uint8, uint8, uint8);
     CDvFramePacket(const uint8 *, uint16, uint8, uint8, uint16);
     CDvFramePacket(uint16, uint8, const uint8 *, const uint8 *, uint8, uint8, const uint8 *, const uint8 *);
+    // M17 constructor
+    CDvFramePacket(const uint8 *codec2, uint16 sid, uint8 pid);
+    // P25 constructor
+    CDvFramePacket(uint16 sid, const uint8 *imbe);
     CDvFramePacket(const CDvFramePacket &);
     
     // destructor
@@ -74,12 +82,17 @@ public:
     const uint8 *GetAmbe(uint8) const;
     const uint8 *GetAmbe(void) const        { return m_uiAmbe; }
     const uint8 *GetAmbePlus(void) const    { return m_uiAmbePlus; }
+    const uint8 *GetCodec2(void) const      { return m_uiCodec2; }
+    const uint8 *GetImbe(void) const        { return m_uiImbe; }
     const uint8 *GetDvData(void) const      { return m_uiDvData; }
     const uint8 *GetDvSync(void) const      { return m_uiDvSync; }
-    
+    bool HasCodec2Data(void) const          { return m_bHasCodec2; }
+    bool HasImbeData(void) const            { return m_bHasImbe; }
+
     // set
     void SetDvData(uint8 *);
     void SetAmbe(uint8, uint8 *);
+    void SetCodec2(const uint8 *);
 
     // operators
     bool operator ==(const CDvFramePacket &) const;
@@ -88,7 +101,9 @@ protected:
     // get
     uint8 *GetAmbeData(void)                { return m_uiAmbe; }
     uint8 *GetAmbePlusData(void)            { return m_uiAmbePlus; }
-    
+    uint8 *GetCodec2Data(void)              { return m_uiCodec2; }
+    uint8 *GetImbeData(void)                { return m_uiImbe; }
+
 protected:
     // data (dstar)
     uint8       m_uiAmbe[AMBE_SIZE];
@@ -96,6 +111,12 @@ protected:
     // data (dmr)
     uint8       m_uiAmbePlus[AMBEPLUS_SIZE];
     uint8       m_uiDvSync[DVSYNC_SIZE];
+    // data (m17)
+    uint8       m_uiCodec2[CODEC2_SIZE];
+    bool        m_bHasCodec2;
+    // data (p25)
+    uint8       m_uiImbe[IMBE_SIZE];
+    bool        m_bHasImbe;
 };
 
 

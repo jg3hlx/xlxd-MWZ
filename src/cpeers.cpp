@@ -84,6 +84,19 @@ void CPeers::AddPeer(CPeer *peer)
         }
         // append peer to reflector peer list
         m_Peers.push_back(peer);
+
+        // Warn if multiple peers share the same IP AND protocol (would conflict in FindPeer)
+        for ( int j = 0; j < (int)m_Peers.size() - 1; j++ )
+        {
+            if ( (m_Peers[j]->GetIp().GetAddr() == peer->GetIp().GetAddr()) &&
+                 (m_Peers[j]->GetProtocol() == peer->GetProtocol()) )
+            {
+                std::cout << "WARNING: Multiple " << peer->GetProtocolName() << " peers from same host - "
+                          << m_Peers[j]->GetCallsign() << " and " << peer->GetCallsign()
+                          << " will conflict in peer lookups" << std::endl;
+            }
+        }
+
         std::cout << "New peer " << peer->GetCallsign() << " at " << peer->GetIp()
                   << " added with protocol " << peer->GetProtocolName()  << std::endl;
         // and append all peer's client to reflector client list
@@ -115,10 +128,13 @@ void CPeers::RemovePeer(CPeer *peer)
                 // remove all clients from reflector client list
                 // it is double lock safe to lock Clients list after Peers list
                 CClients *clients = g_Reflector.GetClients();
-                for ( int i = 0; i < peer->GetNbClients(); i++ )
+                for ( int j = 0; j < peer->GetNbClients(); j++ )
                 {
+                    // null out stream owner pointer before deleting the client,
+                    // preventing dangling pointer dereference in CloseStream
+                    g_Reflector.ReleaseStreamOwner(peer->GetClient(j));
                     // this also delete the client object
-                    clients->RemoveClient(peer->GetClient(i));
+                    clients->RemoveClient(peer->GetClient(j));
                 }
                 // so clear it then
                 m_Peers[i]->ClearClients();
@@ -155,16 +171,17 @@ CPeer *CPeers::GetPeer(int i)
 CPeer *CPeers::FindPeer(const CIp &Ip, int Protocol)
 {
     CPeer *peer = NULL;
-    
-    // find peer
+
+    // find peer by address only (ignore port - ports may differ due to NAT or
+    // stored port vs response port differences in peer connection handshakes)
     for ( int i = 0; (i < m_Peers.size()) && (peer == NULL); i++ )
     {
-        if ( (m_Peers[i]->GetIp() == Ip)  && (m_Peers[i]->GetProtocol() == Protocol))
+        if ( (m_Peers[i]->GetIp().GetAddr() == Ip.GetAddr())  && (m_Peers[i]->GetProtocol() == Protocol))
         {
             peer = m_Peers[i];
         }
     }
-    
+
     // done
     return peer;
 }
@@ -172,18 +189,18 @@ CPeer *CPeers::FindPeer(const CIp &Ip, int Protocol)
 CPeer *CPeers::FindPeer(const CCallsign &Callsign, const CIp &Ip, int Protocol)
 {
     CPeer *peer = NULL;
-    
-    // find peer
+
+    // find peer by callsign and address (ignore port)
     for ( int i = 0; (i < m_Peers.size()) && (peer == NULL); i++ )
     {
         if ( m_Peers[i]->GetCallsign().HasSameCallsign(Callsign) &&
-            (m_Peers[i]->GetIp() == Ip)  &&
+            (m_Peers[i]->GetIp().GetAddr() == Ip.GetAddr())  &&
             (m_Peers[i]->GetProtocol() == Protocol) )
         {
             peer = m_Peers[i];
         }
     }
-    
+
     // done
     return peer;
 }

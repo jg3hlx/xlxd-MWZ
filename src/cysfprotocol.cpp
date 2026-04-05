@@ -27,12 +27,13 @@
 #include "ccrc.h"
 #include "cysfpayload.h"
 #include "cysfclient.h"
-#include "cysfnodedirfile.h"
-#include "cysfnodedirhttp.h"
 #include "cysfutils.h"
 #include "cysfprotocol.h"
 #include "creflector.h"
 #include "cgatekeeper.h"
+#include "cysfpeer.h"
+#include "cysfpeerclient.h"
+#include "cpeercallsignlist.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // constructor
@@ -63,10 +64,12 @@ bool CYsfProtocol::Init(void)
     
     // init the wiresx cmd handler
     ok &= m_WiresxCmdHandler.Init();
-    
+
     // update time
     m_LastKeepaliveTime.Now();
-    
+    m_LastYsfPeerLinkTime.Now();
+    m_LastYsfPeerKeepaliveTime.Now();
+
     // done
     return ok;
 }
@@ -83,7 +86,7 @@ void CYsfProtocol::Close(void)
 ////////////////////////////////////////////////////////////////////////////////////////
 // task
 
-void CYsfProtocol::Task(void)
+void CYsfProtocol::RxTask(void)
 {
     CBuffer             Buffer;
     CIp                 Ip;
@@ -115,11 +118,8 @@ void CYsfProtocol::Task(void)
         // crack the packet
         if ( IsValidDvPacket(Buffer, &Fich) )
         {
-           //std::cout << "FN = " << (int)Fich.getFN() << "  FT = " << (int)Fich.getFT() << std::endl;
             if ( IsValidDvFramePacket(Ip, Fich, Buffer, Frames) )
             {
-                //std::cout << "YSF DV frame"  << std::endl;
-                
                 // handle it
                 OnDvFramePacketIn(Frames[0], &Ip);
                 OnDvFramePacketIn(Frames[1], &Ip);
@@ -129,16 +129,39 @@ void CYsfProtocol::Task(void)
             }
             else if ( IsValidDvHeaderPacket(Ip, Fich, Buffer, &Header, Frames) )
             {
-                //std::cout << "YSF DV header:"  << std::endl << *Header << std::endl;
-                //std::cout << "YSF DV header:"  << std::endl;
-                
+                // IsValidDvHeaderPacket allocates dummy silence frames alongside the header
+                // We only need the header — delete the frames to avoid a leak
+                delete Frames[0];
+                delete Frames[1];
+                Frames[0] = NULL;
+                Frames[1] = NULL;
+
+                // Skip gatekeeper check for peer connections (we initiated these)
+                bool isPeer = false;
+                char clientModule = ' ';
+                {
+                    CPeers *peers = g_Reflector.GetPeers();
+                    isPeer = (peers->FindPeer(Ip, PROTOCOL_YSF) != NULL);
+                    g_Reflector.ReleasePeers();
+                }
+
+                // For YSF clients, look up their assigned module for gatekeeper check (not RPT2)
+                if ( !isPeer )
+                {
+                    CClients *clients = g_Reflector.GetClients();
+                    CClient *client = clients->FindClient(Ip, PROTOCOL_YSF);
+                    if ( client != NULL )
+                    {
+                        clientModule = client->GetReflectorModule();
+                    }
+                    g_Reflector.ReleaseClients();
+                }
+
                 // node linked and callsign muted?
-                if ( g_GateKeeper.MayTransmit(Header->GetMyCallsign(), Ip, PROTOCOL_YSF, Header->GetRpt2Module())  )
+                if ( isPeer || g_GateKeeper.MayTransmit(Header->GetMyCallsign(), Ip, PROTOCOL_YSF, clientModule) )
                 {
                     // handle it
                     OnDvHeaderPacketIn(Header, Ip);
-                    //OnDvFramePacketIn(Frames[0], &Ip);
-                    //OnDvFramePacketIn(Frames[1], &Ip);
                 }
                 else
                 {
@@ -147,8 +170,6 @@ void CYsfProtocol::Task(void)
             }
             else if ( IsValidDvLastFramePacket(Ip, Fich, Buffer, Frames) )
             {
-                //std::cout << "YSF last DV frame"  << std::endl;
-
                 // handle it
                 OnDvFramePacketIn(Frames[0], &Ip);
                 OnDvLastFramePacketIn((CDvLastFramePacket *)Frames[1], &Ip);
@@ -156,50 +177,128 @@ void CYsfProtocol::Task(void)
         }
         else if ( IsValidConnectPacket(Buffer, &Callsign) )
         {
-            //std::cout << "YSF keepalive/connect packet from " << Callsign << " at " << Ip << std::endl;
-            
-            // callsign authorized?
-            if ( g_GateKeeper.MayLink(Callsign, Ip, PROTOCOL_YSF) )
+            // Check if this is a poll response from a YSF reflector peer we connected to
+            CPeers *peers = g_Reflector.GetPeers();
+            CPeer *existingPeer = peers->FindPeer(Ip, PROTOCOL_YSF);
+
+            if ( existingPeer != NULL )
             {
-                // acknowledge the request
-                EncodeConnectAckPacket(&Buffer);
-                m_Socket.Send(Buffer, Ip);
-                
-                // add client if needed
+                // This is a poll response from a YSF peer - mark it alive
+                existingPeer->Alive();
+                g_Reflector.ReleasePeers();
+
+                // Also keep the corresponding client alive
                 CClients *clients = g_Reflector.GetClients();
-                CClient *client = clients->FindClient(Callsign, Ip, PROTOCOL_YSF);
-                // client already connected ?
-                if ( client == NULL )
+                int index = -1;
+                CClient *client = NULL;
+                while ( (client = clients->FindNextClient(PROTOCOL_YSF, &index)) != NULL )
                 {
-                    std::cout << "YSF connect packet from " << Callsign << " at " << Ip << std::endl;
-                    
-                    // create the client
-                    CYsfClient *newclient = new CYsfClient(Callsign, Ip);
-                    
-                    // aautolink, if enabled
-                    #if YSF_AUTOLINK_ENABLE
-                        newclient->SetReflectorModule(YSF_AUTOLINK_MODULE);
-                    #endif
-                    
-                    // and append
-                    clients->AddClient(newclient);
+                    if ( client->IsPeer() && (client->GetIp() == Ip) )
+                    {
+                        client->Alive();
+                        break;
+                    }
+                }
+                g_Reflector.ReleaseClients();
+            }
+            else
+            {
+                // Release Peers before acquiring GK to prevent lock-order inversion
+                g_Reflector.ReleasePeers();
+
+                // Snapshot GK data for this IP
+                CCallsign peerCallsign;
+                char peerModule = ' ';
+                uint32_t ysfId = 0;
+                bool foundInGk = false;
+                {
+                    CPeerCallsignList *list = g_GateKeeper.GetPeerList();
+                    CCallsignListItem *item = FindYsfPeerByIp(list, Ip);
+                    if ( item != NULL )
+                    {
+                        peerCallsign = item->GetCallsign();
+                        peerModule = item->GetModules()[0];
+                        char cs[CALLSIGN_LEN + 1];
+                        item->GetCallsign().GetCallsign((uint8 *)cs);
+                        cs[CALLSIGN_LEN] = '\0';
+                        ysfId = (uint32_t)::atoi(cs + 3);
+                        foundInGk = true;
+                    }
+                    g_GateKeeper.ReleasePeerList();
+                }
+
+                if ( foundInGk )
+                {
+                    // Create the YSF peer object with its client attached
+                    CVersion version(1, 0, 0);
+                    char modules[2] = { peerModule, '\0' };
+
+                    CYsfPeer *newPeer = new CYsfPeer(peerCallsign, Ip, modules, version);
+                    newPeer->Alive();
+                    newPeer->SetYsfId(ysfId);
+
+                    std::cout << "YSF peer " << peerCallsign << " connected on module " << peerModule << std::endl;
+
+                    // AddPeer registers peer and its clients in the reflector
+                    CPeers *peers2 = g_Reflector.GetPeers();
+                    peers2->AddPeer(newPeer);
+                    g_Reflector.ReleasePeers();
                 }
                 else
                 {
-                    client->Alive();
+
+                    // Not a YSF peer, handle as regular client
+                    // callsign authorized as a regular client?
+                    if ( g_GateKeeper.MayLink(Callsign, Ip, PROTOCOL_YSF) )
+                    {
+                        // acknowledge the request
+                        EncodeConnectAckPacket(&Buffer);
+                        m_Socket.Send(Buffer, Ip);
+
+                        // add client if needed
+                        CClients *clients = g_Reflector.GetClients();
+                        CClient *client = clients->FindClient(Callsign, Ip, PROTOCOL_YSF);
+                        // client already connected ?
+                        if ( client == NULL )
+                        {
+                            std::cout << "YSF connect packet from " << Callsign << " at " << Ip << std::endl;
+
+                            // create the client
+                            CYsfClient *newclient = new CYsfClient(Callsign, Ip);
+
+                            // autolink, if enabled
+                            #if YSF_AUTOLINK_ENABLE
+                                newclient->SetReflectorModule(YSF_AUTOLINK_MODULE);
+                            #endif
+
+                            // and append
+                            clients->AddClient(newclient);
+                        }
+                        else
+                        {
+                            client->Alive();
+                        }
+                        // and done
+                        g_Reflector.ReleaseClients();
+                    }
                 }
-                // and done
-                g_Reflector.ReleaseClients();
             }
         }
         else if ( IsValidwirexPacket(Buffer, &Fich, &Callsign, &iWiresxCmd, &iWiresxArg) )
         {
-            //std::cout << "YSF Wires-x frame"  << std::endl;
-            // prepare the cmd object
-            WiresxCmd = CWiresxCmd(Ip, Callsign, iWiresxCmd, iWiresxArg);
-            // and post it to hadler's queue
-            m_WiresxCmdHandler.GetCmdQueue()->push(WiresxCmd);
-            m_WiresxCmdHandler.ReleaseCmdQueue();
+            // Ignore Wires-X commands from YSF peers - only process from direct clients
+            CPeers *peers = g_Reflector.GetPeers();
+            CPeer *peer = peers->FindPeer(Ip, PROTOCOL_YSF);
+            g_Reflector.ReleasePeers();
+
+            if ( peer == NULL )
+            {
+                // Not from a YSF peer, process the command
+                WiresxCmd = CWiresxCmd(Ip, Callsign, iWiresxCmd, iWiresxArg);
+                m_WiresxCmdHandler.GetCmdQueue()->push(WiresxCmd);
+                m_WiresxCmdHandler.ReleaseCmdQueue();
+            }
+            // else: silently ignore Wires-X commands from YSF peers
         }
         else if ( IsValidServerStatusPacket(Buffer) )
         {
@@ -219,17 +318,36 @@ void CYsfProtocol::Task(void)
     // handle end of streaming timeout
     CheckStreamsTimeout();
     
-    // handle queue from reflector
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// TX task — runs on separate thread, never blocked by CloseStream
+
+void CYsfProtocol::TxTask(void)
+{
+    {
+        std::unique_lock<std::mutex> lk(m_QueueCondMutex);
+        m_QueueCondVar.wait_for(lk, std::chrono::milliseconds(20));
+    }
+
     HandleQueue();
-    
-    // keep client alive
+
     if ( m_LastKeepaliveTime.DurationSinceNow() > YSF_KEEPALIVE_PERIOD )
     {
-        //
         HandleKeepalives();
-        
-        // update time
         m_LastKeepaliveTime.Now();
+    }
+
+    if ( m_LastYsfPeerLinkTime.DurationSinceNow() > YSF_PEER_RECONNECT_PERIOD )
+    {
+        HandleYsfPeerLinks();
+        m_LastYsfPeerLinkTime.Now();
+    }
+
+    if ( m_LastYsfPeerKeepaliveTime.DurationSinceNow() > YSF_PEER_KEEPALIVE_PERIOD )
+    {
+        HandleYsfPeerKeepalives();
+        m_LastYsfPeerKeepaliveTime.Now();
     }
 }
 
@@ -239,52 +357,81 @@ void CYsfProtocol::Task(void)
 bool CYsfProtocol::OnDvHeaderPacketIn(CDvHeaderPacket *Header, const CIp &Ip)
 {
     bool newstream = false;
-    
-    // find the stream
-    CPacketStream *stream = GetStream(Header->GetStreamId());
+
+    // set default suffix if not already set
+    if ( !Header->HasMySuffix() )
+    {
+        Header->SetMySuffix("YSF");
+    }
+
+    // find the stream (match on both StreamId and IP to avoid false matches)
+    CPacketStream *stream = GetStream(Header->GetStreamId(), &Ip);
     if ( stream == NULL )
     {
         // no stream open yet, open a new one
         CCallsign via(Header->GetRpt1Callsign());
-        
+        CCallsign myCallsign;
+        CCallsign rpt2Callsign;
+
         // find this client
-        CClient *client = g_Reflector.GetClients()->FindClient(Ip, PROTOCOL_YSF);
+        CClients *clients = g_Reflector.GetClients();
+        CClient *client = clients->FindClient(Ip, PROTOCOL_YSF);
+
+        // If not found by exact IP match, check if this is from a YSF peer
+        // (peer clients may have been created with a different port)
+        if ( client == NULL )
+        {
+            // Look through all YSF protocol clients for a matching IP address (ignoring port)
+            int index = -1;
+            CClient *c = NULL;
+            while ( (c = clients->FindNextClient(PROTOCOL_YSF, &index)) != NULL )
+            {
+                if ( c->IsPeer() && (c->GetIp() == Ip) )
+                {
+                    client = c;
+                    break;
+                }
+            }
+        }
+
         if ( client != NULL )
         {
             // get client callsign
             via = client->GetCallsign();
 
-            if ( Header->GetRpt2Module() == ' ' ) {
-                // module not filled, get module it's linked to
-                Header->SetRpt2Module(client->GetReflectorModule());
-            } else {
-                // handle changing linked module to the one set on rpt2
-                if ( client->GetReflectorModule() != Header->GetRpt2Module() ) {
-                    std::cout << "YSF client " << client->GetCallsign() << " linking on module " << Header->GetRpt2Module() << std::endl;
-                    client->SetReflectorModule(Header->GetRpt2Module());
-                }
-            }
+            // For YSF, always use client's assigned module (RPT2 is a D-Star concept)
+            Header->SetRpt2Module(client->GetReflectorModule());
+
+            // save callsigns before OpenStream — OpenStream transfers Header
+            // to the router queue where the router thread may delete it
+            myCallsign = Header->GetMyCallsign();
+            rpt2Callsign = Header->GetRpt2Callsign();
 
             // and try to open the stream
             if ( (stream = g_Reflector.OpenStream(Header, client)) != NULL )
             {
-                // keep the handle
+                // keep the handle — Header ownership transferred to stream
                 m_Streams.push_back(stream);
                 newstream = true;
+                Header = NULL;
+            }
+            else if ( g_Reflector.TryLateEntry(Header, client) )
+            {
+                Header = NULL;  // ownership transferred
             }
         }
         // release
         g_Reflector.ReleaseClients();
-        
+
         // update last heard
-        if ( g_Reflector.IsValidModule(Header->GetRpt2Module()) )
+        if ( newstream )
         {
-            g_Reflector.GetUsers()->Hearing(Header->GetMyCallsign(), via, Header->GetRpt2Callsign());
+            g_Reflector.GetUsers()->Hearing(myCallsign, via, rpt2Callsign);
             g_Reflector.ReleaseUsers();
         }
-        
+
         // delete header if needed
-        if ( !newstream )
+        if ( Header != NULL )
         {
             delete Header;
         }
@@ -303,81 +450,274 @@ bool CYsfProtocol::OnDvHeaderPacketIn(CDvHeaderPacket *Header, const CIp &Ip)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
+// client cache helpers
+
+void CYsfProtocol::RefreshClientCache(int iModId)
+{
+    // bounds check
+    if ( iModId < 0 || iModId >= NB_OF_MODULES )
+    {
+        return;
+    }
+
+    // Check freshness under cache lock, release before acquiring Clients lock
+    // to prevent cache→Clients lock inversion
+    {
+        std::lock_guard<std::mutex> lock(m_ClientCache[iModId].m_Mutex);
+        if ( m_ClientCache[iModId].m_bInitialized &&
+             m_ClientCache[iModId].m_LastRefresh.DurationSinceNow() < YSF_CLIENT_CACHE_REFRESH_INTERVAL )
+        {
+            return;  // Cache is still fresh
+        }
+    }
+
+    // Scan clients WITHOUT holding cache lock
+    char moduleId = 'A' + iModId;
+    std::vector<CIp> freshIps;
+    std::vector<CIp> freshPeerIps;
+
+    CClients *clients = g_Reflector.GetClients();
+    int index = -1;
+    CClient *client = NULL;
+    while ( (client = clients->FindNextClient(PROTOCOL_YSF, &index)) != NULL )
+    {
+        if ( client->GetReflectorModule() == moduleId )
+        {
+            if ( client->IsPeer() && !client->IsAMaster() )
+            {
+                freshPeerIps.push_back(client->GetIp());
+            }
+            else if ( !client->IsAMaster() && !client->IsPeer() )
+            {
+                freshIps.push_back(client->GetIp());
+            }
+        }
+    }
+    g_Reflector.ReleaseClients();
+
+    // Write results under cache lock
+    std::lock_guard<std::mutex> lock(m_ClientCache[iModId].m_Mutex);
+    m_ClientCache[iModId].m_ClientIps.swap(freshIps);
+    m_ClientCache[iModId].m_PeerClientIps.swap(freshPeerIps);
+    m_ClientCache[iModId].m_LastRefresh.Now();
+    m_ClientCache[iModId].m_bInitialized = true;
+}
+
+void CYsfProtocol::SendToModuleClients(int iModId, const CBuffer &buffer, uint16 streamId)
+{
+    // bounds check
+    if ( iModId < 0 || iModId >= NB_OF_MODULES )
+    {
+        return;
+    }
+
+    // snapshot owner fields under slot lock
+    bool hasOwner = false;
+    uint16 cachedStreamId = 0;
+    CIp ownerIpCopy;
+    {
+        std::lock_guard<std::mutex> slotLock(m_StreamsCache[iModId].m_Mutex);
+        hasOwner = m_StreamsCache[iModId].m_bHasOwner;
+        cachedStreamId = m_StreamsCache[iModId].m_uiOutboundStreamId;
+        ownerIpCopy = m_StreamsCache[iModId].m_OwnerIp;
+    }
+
+    // refresh cache if needed
+    RefreshClientCache(iModId);
+
+    // send to cached clients (cache mutex is TX-thread-only, safe to hold during sends)
+    std::lock_guard<std::mutex> lock(m_ClientCache[iModId].m_Mutex);
+    for ( const CIp &ip : m_ClientCache[iModId].m_ClientIps )
+    {
+        // skip the stream owner to prevent audio echo back to transmitter
+        if ( hasOwner && cachedStreamId == streamId && ownerIpCopy == ip )
+        {
+            continue;
+        }
+        m_Socket.SendVoice(buffer, ip);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
 // queue helper
 
 void CYsfProtocol::HandleQueue(void)
 {
-    
+    // drain queue quickly while holding lock
+    std::vector<CPacket *> packets;
+    packets.reserve(100);
+
     m_Queue.Lock();
     while ( !m_Queue.empty() )
     {
-        // get the packet
-        CPacket *packet = m_Queue.front();
+        packets.push_back(m_Queue.front());
         m_Queue.pop();
-        
+    }
+    m_Queue.Unlock();
+
+    // process packets without holding queue lock
+    CBuffer buffer;
+    buffer.reserve(256);
+
+    for ( size_t i = 0; i < packets.size(); i++ )
+    {
+        CPacket *packet = packets[i];
+        packets[i] = NULL;  // clear to prevent double-delete on exception
+
         // get our sender's id
         int iModId = g_Reflector.GetModuleIndex(packet->GetModuleId());
-        
+
+        // bounds check
+        if ( iModId < 0 || iModId >= NB_OF_MODULES )
+        {
+            delete packet;
+            continue;
+        }
+
         // encode
-        CBuffer buffer;
-        
+        buffer.clear();
+
+        // snapshot owner fields under slot lock for send loops
+        CIp ownerIpCopy;
+        bool hasOwner = false;
+        uint16 outboundStreamId = 0;
+
         // check if it's header
         if ( packet->IsDvHeader() )
         {
-            // update local stream cache
-            // this relies on queue feeder setting valid module id
+            // update local stream cache and capture owner under slot lock
+            std::lock_guard<std::mutex> slotLock(m_StreamsCache[iModId].m_Mutex);
+
             m_StreamsCache[iModId].m_dvHeader = CDvHeaderPacket((const CDvHeaderPacket &)*packet);
-            
+            m_StreamsCache[iModId].m_uiOutboundStreamId = packet->GetStreamId();
+            m_StreamsCache[iModId].m_uiLastSubid = 0;
+            // clear frame cache to prevent stale data from previous stream
+            for ( int j = 0; j < 5; j++ )
+                m_StreamsCache[iModId].m_dvFrames[j] = CDvFramePacket();
+
+            // capture owner IP from stream (once at header time)
+            m_StreamsCache[iModId].m_bHasOwner = false;
+            CPacketStream *ownerStream = g_Reflector.GetStream(packet->GetModuleId());
+            if ( ownerStream != NULL )
+            {
+                ownerStream->Lock();
+                if ( ownerStream->IsOpen() && ownerStream->GetStreamId() == packet->GetStreamId() )
+                {
+                    const CIp *ownerIp = ownerStream->GetOwnerIp();
+                    if ( ownerIp != NULL )
+                    {
+                        m_StreamsCache[iModId].m_OwnerIp = *ownerIp;
+                        m_StreamsCache[iModId].m_bHasOwner = true;
+                    }
+                }
+                ownerStream->Unlock();
+            }
+
+            // snapshot for send loops
+            hasOwner = m_StreamsCache[iModId].m_bHasOwner;
+            ownerIpCopy = m_StreamsCache[iModId].m_OwnerIp;
+            outboundStreamId = m_StreamsCache[iModId].m_uiOutboundStreamId;
+
             // encode it
             EncodeDvHeaderPacket((const CDvHeaderPacket &)*packet, &buffer);
         }
         // check if it's a last frame
         else if ( packet->IsLastPacket() )
         {
-            // encode it
+            // snapshot owner and cache fields under slot lock
+            {
+                std::lock_guard<std::mutex> slotLock(m_StreamsCache[iModId].m_Mutex);
+                hasOwner = m_StreamsCache[iModId].m_bHasOwner;
+                ownerIpCopy = m_StreamsCache[iModId].m_OwnerIp;
+                outboundStreamId = m_StreamsCache[iModId].m_uiOutboundStreamId;
+            }
+
+            // flush any incomplete quintuplet before sending terminator
+            // pad missing frame slots with zeros (0x00)
+            if ( m_StreamsCache[iModId].m_uiLastSubid > 0 )
+            {
+                uint8 zeroAmbe[9];
+                ::memset(zeroAmbe, 0, sizeof(zeroAmbe));
+                for ( int j = m_StreamsCache[iModId].m_uiLastSubid; j <= 4; j++ )
+                {
+                    CDvFramePacket zeroFrame(zeroAmbe, (uint8 *)"\x00\x00\x00\x00\x00\x00\x00",
+                                             outboundStreamId, 0, j);
+                    m_StreamsCache[iModId].m_dvFrames[j] = zeroFrame;
+                }
+                CBuffer flushBuf;
+                EncodeDvPacket(m_StreamsCache[iModId].m_dvHeader, m_StreamsCache[iModId].m_dvFrames, &flushBuf);
+                if ( flushBuf.size() > 0 )
+                {
+                    SendToModuleClients(iModId, flushBuf, packet->GetStreamId());
+
+                    // also send to peer clients via cache (no GetClients lock needed)
+                    {
+                        std::lock_guard<std::mutex> cacheLock(m_ClientCache[iModId].m_Mutex);
+                        for ( const CIp &peerIp : m_ClientCache[iModId].m_PeerClientIps )
+                        {
+                            if ( hasOwner && ownerIpCopy == peerIp )
+                                continue;
+                            m_Socket.SendVoice(flushBuf, peerIp);
+                        }
+                    }
+                }
+                m_StreamsCache[iModId].m_uiLastSubid = 0;
+            }
+
+            // now send the terminator
             EncodeDvLastPacket(m_StreamsCache[iModId].m_dvHeader, &buffer);
         }
         // otherwise, just a regular DV frame
         else
         {
-            // update local stream cache or send triplet when needed
+            // snapshot owner under slot lock
+            {
+                std::lock_guard<std::mutex> slotLock(m_StreamsCache[iModId].m_Mutex);
+                hasOwner = m_StreamsCache[iModId].m_bHasOwner;
+                ownerIpCopy = m_StreamsCache[iModId].m_OwnerIp;
+                outboundStreamId = m_StreamsCache[iModId].m_uiOutboundStreamId;
+            }
+
+            // update local stream cache or send quintuplet when needed
             uint8 sid = packet->GetYsfPacketSubId();
+
             if ( (sid >= 0) && (sid <= 4) )
             {
-                //std::cout << (int)sid;
                 m_StreamsCache[iModId].m_dvFrames[sid] = CDvFramePacket((const CDvFramePacket &)*packet);
+                m_StreamsCache[iModId].m_uiLastSubid = sid + 1;
                 if ( sid == 4 )
                 {
-                    
                     EncodeDvPacket(m_StreamsCache[iModId].m_dvHeader, m_StreamsCache[iModId].m_dvFrames, &buffer);
+                    m_StreamsCache[iModId].m_uiLastSubid = 0;
                 }
             }
         }
-        
+
         // send it
         if ( buffer.size() > 0 )
         {
-            // and push it to all our clients linked to the module and who are not streaming in
-            CClients *clients = g_Reflector.GetClients();
-            int index = -1;
-            CClient *client = NULL;
-            while ( (client = clients->FindNextClient(PROTOCOL_YSF, &index)) != NULL )
+            // send to non-peer clients via cache
+            SendToModuleClients(iModId, buffer, packet->GetStreamId());
+
+            // send to peer clients via cache (no GetClients lock needed)
             {
-                // is this client busy ?
-                if ( !client->IsAMaster() && (client->GetReflectorModule() == packet->GetModuleId()) )
+                std::lock_guard<std::mutex> cacheLock(m_ClientCache[iModId].m_Mutex);
+                for ( const CIp &peerIp : m_ClientCache[iModId].m_PeerClientIps )
                 {
-                    // no, send the packet
-                    m_Socket.Send(buffer, client->GetIp());
-                    
+                    // Skip if this stream originated from this peer (prevent loop)
+                    // Full IP:port match — remote hosts may run multiple modes on different ports
+                    if ( hasOwner && ownerIpCopy == peerIp )
+                    {
+                        continue;
+                    }
+                    m_Socket.SendVoice(buffer, peerIp);
                 }
             }
-            g_Reflector.ReleaseClients();
         }
-        
+
         // done
         delete packet;
     }
-    m_Queue.Unlock();
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -389,12 +729,19 @@ void CYsfProtocol::HandleKeepalives(void)
     // here, just check that all clients are still alive
     // and disconnect them if not
     
-    // iterate on clients
+    // iterate on clients, collect stale ones for removal
+    // (RemoveClient erases from vector, invalidating FindNextClient iterator)
+    std::vector<CClient *> toRemoveClients;
     CClients *clients = g_Reflector.GetClients();
     int index = -1;
     CClient *client = NULL;
     while ( (client = clients->FindNextClient(PROTOCOL_YSF, &index)) != NULL )
     {
+        // peer clients are managed by HandleYsfPeerKeepalives, skip them here
+        if ( client->IsPeer() )
+        {
+            continue;
+        }
         // is this client busy ?
         if ( client->IsAMaster() )
         {
@@ -404,11 +751,14 @@ void CYsfProtocol::HandleKeepalives(void)
         // check it's still with us
         else if ( !client->IsAlive() )
         {
-            // no, remove it
-            std::cout << "YSF client " << client->GetCallsign() << " keepalive timeout" << std::endl;
-            clients->RemoveClient(client);
+            // no, collect for removal
+            toRemoveClients.push_back(client);
         }
-        
+    }
+    for ( size_t i = 0; i < toRemoveClients.size(); i++ )
+    {
+        std::cout << "YSF client " << toRemoveClients[i]->GetCallsign() << " keepalive timeout" << std::endl;
+        clients->RemoveClient(toRemoveClients[i]);
     }
     g_Reflector.ReleaseClients();
 }
@@ -433,12 +783,12 @@ bool CYsfProtocol::IsValidConnectPacket(const CBuffer &Buffer, CCallsign *callsi
 bool CYsfProtocol::IsValidDvPacket(const CBuffer &Buffer, CYSFFICH *Fich)
 {
     uint8 tag[] = { 'Y','S','F','D' };
-    
+
     bool valid = false;
 
     if ( (Buffer.size() == 155) && (Buffer.Compare(tag, sizeof(tag)) == 0) )
     {
-        // decode YSH fich
+        // decode YSF fich
         if ( Fich->decode(&(Buffer.data()[40])) )
         {
             valid = (Fich->getDT() == YSF_DT_VD_MODE2);
@@ -473,22 +823,20 @@ bool CYsfProtocol::IsValidDvHeaderPacket(const CIp &Ip, const CYSFFICH &Fich, co
             csMY.SetYsfCallsign(sz);
             ::memcpy(sz, &(Buffer.data()[4]), YSF_CALLSIGN_LENGTH);
             sz[YSF_CALLSIGN_LENGTH] = 0;
-            CCallsign rpt1 = CCallsign((const char *)sz);
-            rpt1.SetModule(YSF_MODULE_ID);
-            CCallsign rpt2 = m_ReflectorCallsign;
+            // Get the module this peer is linked to
+            CPeers *peers = g_Reflector.GetPeers();
+            CPeer *peer = peers->FindPeer(Ip, PROTOCOL_YSF);
+            char ysfModule = ' ';
+            if ( peer != NULL && peer->GetNbClients() > 0 )
+            {
+                ysfModule = peer->GetClient(0)->GetReflectorModule();
+            }
+            g_Reflector.ReleasePeers();
 
-            if ( (Fich.getSQ() >= 10) && (Fich.getSQ() < 10+NB_OF_MODULES) )
-            {
-                // set module based on DG-ID value
-                rpt2.SetModule( 'A' + (char)(Fich.getSQ() - 10) );
-            }
-            else
-            {
-                // as YSF protocol does not provide a module-tranlatable
-                // destid, set module to none and rely on OnDvHeaderPacketIn()
-                // to later fill it with proper value
-                rpt2.SetModule(' ');
-            }
+            CCallsign rpt1 = m_ReflectorCallsign;
+            rpt1.SetModule(ysfModule);
+            CCallsign rpt2 = m_ReflectorCallsign;
+            rpt2.SetModule('G');
             
             // and packet
             *header = new CDvHeaderPacket(csMY, CCallsign("CQCQCQ"), rpt1, rpt2, uiStreamId, Fich.getFN());
@@ -548,6 +896,11 @@ bool CYsfProtocol::IsValidDvFramePacket(const CIp &Ip, const CYSFFICH &Fich, con
         uint8   ambe4[AMBEPLUS_SIZE];
         uint8 *ambes[5] = { ambe0, ambe1, ambe2, ambe3, ambe4 };
         CYsfUtils::DecodeVD2Vchs((unsigned char *)&(Buffer.data()[35]), ambes);
+
+        // Adjust gain for YSF→DMR direction
+        for (unsigned int i = 0; i < 5; i++) {
+            CYsfUtils::AdjustAmbeGain(ambes[i], GAIN_YSF_TO_DMR / 10.0f);
+        }
 
         // get DV frames
         uint8 fid = Buffer.data()[34];
@@ -733,10 +1086,13 @@ bool CYsfProtocol::EncodeDvPacket(const CDvHeaderPacket &Header, const CDvFrameP
     CYSFPayload payload;
     uint8 temp[120];
     ::memset(temp, 0x00, sizeof(temp));
-    // DV
-    for ( int i = 0; i < 5; i++ )
+    // DV - with gain adjustment for DMR→YSF direction
+    for (unsigned int i = 0; i < 5; i++)
     {
-        CYsfUtils::EncodeVD2Vch((unsigned char *)DvFrames[i].GetAmbePlus(), temp+35+(18*i));
+        uint8 ambe_copy[AMBEPLUS_SIZE];
+        ::memcpy(ambe_copy, DvFrames[i].GetAmbePlus(), AMBEPLUS_SIZE);
+        CYsfUtils::AdjustAmbeGain(ambe_copy, GAIN_DMR_TO_YSF / 10.0f);
+        CYsfUtils::EncodeVD2Vch(ambe_copy, temp+35+(18*i));
     }
     // data
     switch (DvFrames[0].GetYsfPacketId())
@@ -1136,15 +1492,200 @@ bool CYsfProtocol::DebugDumpLastDvPacket(const CBuffer &Buffer)
     uint8 data[200];
 
     :: memset(data, 0, sizeof(data));
-    
+
 
     ok = IsValidDvPacket(Buffer, &fich);
     if ( ok && (fich.getFI() == YSF_FI_TERMINATOR) )
     {
         ok &= payload.processHeaderData((unsigned char *)&(Buffer.data()[35]));
     }
-    
+
     std::cout << "TC-" <<(ok ? "ok " : "xx ") << "src: " << payload.getSource() << "dest: " << payload.getDest() << std::endl;
 
     return ok;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// YSF peer helpers
+
+void CYsfProtocol::HandleYsfPeerLinks(void)
+{
+    CBuffer buffer;
+
+    // Snapshot the peer list under the GK lock, then release BEFORE acquiring
+    // Peers lock. Prevents ABBA: RX holds Clients → GK (via MayLink).
+    std::vector<CCallsignListItem> peerListSnapshot;
+    {
+        CPeerCallsignList *list = g_GateKeeper.GetPeerList();
+        peerListSnapshot.assign(list->begin(), list->end());
+        g_GateKeeper.ReleasePeerList();
+    }
+
+    CPeers *peers = g_Reflector.GetPeers();
+
+    // check if all our connected YSF peers are still listed by gatekeeper
+    // collect peers to remove (RemovePeer erases from vector, invalidating iterator)
+    std::vector<CPeer *> toRemove;
+    int index = -1;
+    CPeer *peer = NULL;
+    while ( (peer = peers->FindNextPeer(PROTOCOL_YSF, &index)) != NULL )
+    {
+        bool foundInList = false;
+        for ( const auto &item : peerListSnapshot )
+        {
+            if ( item.GetCallsign().HasSameCallsign(peer->GetCallsign()) )
+            {
+                foundInList = true;
+                break;
+            }
+        }
+        if ( !foundInList )
+        {
+            toRemove.push_back(peer);
+        }
+    }
+    for ( size_t i = 0; i < toRemove.size(); i++ )
+    {
+        std::cout << "YSF peer " << toRemove[i]->GetCallsign() << " removed - no longer in peer list" << std::endl;
+        peers->RemovePeer(toRemove[i]);
+    }
+
+    // check if all YSF peers listed by gatekeeper are connected
+    // if not, connect
+    for ( size_t i = 0; i < peerListSnapshot.size(); i++ )
+    {
+        CCallsignListItem *item = &peerListSnapshot[i];
+
+        // Only process YSF peers (callsign starts with "YSF")
+        if ( !IsYsfPeerCallsign(item->GetCallsign()) )
+        {
+            continue;
+        }
+
+        if ( peers->FindPeer(item->GetCallsign(), PROTOCOL_YSF) == NULL )
+        {
+            // resolve again peer's IP in case it's a dynamic IP
+            item->ResolveIp();
+
+            // get the port (custom or default)
+            uint16 port = item->GetPort();
+            if ( port == 0 )
+            {
+                port = YSF_PORT;
+            }
+
+            // send poll packet to initiate connection
+            std::cout << "YSF connecting to peer " << item->GetCallsign()
+                      << " @ " << item->GetIp() << ":" << port
+                      << " on module " << item->GetModules() << std::endl;
+            EncodePollPacket(&buffer, g_Reflector.GetCallsign());
+            m_Socket.Send(buffer, item->GetIp(), port);
+        }
+    }
+
+    // done
+    g_Reflector.ReleasePeers();
+}
+
+void CYsfProtocol::HandleYsfPeerKeepalives(void)
+{
+    CBuffer buffer;
+
+    // Snapshot peer list under GK lock, release before Peers lock
+    std::vector<CCallsignListItem> peerListSnapshot;
+    {
+        CPeerCallsignList *list = g_GateKeeper.GetPeerList();
+        peerListSnapshot.assign(list->begin(), list->end());
+        g_GateKeeper.ReleasePeerList();
+    }
+
+    CPeers *peers = g_Reflector.GetPeers();
+
+    // send keepalive to all connected YSF peers, collect timed-out ones for removal
+    std::vector<CPeer *> toRemove;
+    int index = -1;
+    CPeer *peer = NULL;
+    while ( (peer = peers->FindNextPeer(PROTOCOL_YSF, &index)) != NULL )
+    {
+        CYsfPeer *ysfPeer = (CYsfPeer *)peer;
+
+        // check if still alive
+        if ( !ysfPeer->IsAlive() )
+        {
+            toRemove.push_back(peer);
+        }
+        else
+        {
+            // find the port for this peer from snapshot
+            CCallsignListItem *item = NULL;
+            for ( auto &snapItem : peerListSnapshot )
+            {
+                if ( snapItem.GetCallsign().HasSameCallsign(peer->GetCallsign()) )
+                {
+                    item = &snapItem;
+                    break;
+                }
+            }
+            uint16 port = YSF_PORT;
+            if ( item != NULL && item->GetPort() != 0 )
+            {
+                port = item->GetPort();
+            }
+
+            // send keepalive poll
+            EncodePollPacket(&buffer, g_Reflector.GetCallsign());
+            m_Socket.Send(buffer, peer->GetIp(), port);
+        }
+    }
+    for ( size_t i = 0; i < toRemove.size(); i++ )
+    {
+        std::cout << "YSF peer " << toRemove[i]->GetCallsign() << " keepalive timeout" << std::endl;
+        peers->RemovePeer(toRemove[i]);
+    }
+
+    // done
+    g_Reflector.ReleasePeers();
+}
+
+bool CYsfProtocol::IsYsfPeerCallsign(const CCallsign &callsign) const
+{
+    char cs[CALLSIGN_LEN + 1];
+    callsign.GetCallsign((uint8 *)cs);
+    cs[CALLSIGN_LEN] = '\0';
+    return (::strncmp(cs, "YSF", 3) == 0);
+}
+
+CCallsignListItem *CYsfProtocol::FindYsfPeerByIp(CPeerCallsignList *list, const CIp &ip)
+{
+    // Search for a YSF peer matching this IP
+    // This is needed because multiple peers (YSF, NXDN) might share the same IP
+    for ( int i = 0; i < list->size(); i++ )
+    {
+        CCallsignListItem *item = &((list->data())[i]);
+
+        // Check if this is a YSF peer (callsign starts with "YSF")
+        if ( IsYsfPeerCallsign(item->GetCallsign()) )
+        {
+            // Check if IP matches
+            if ( item->GetIp().GetAddr() == ip.GetAddr() )
+            {
+                return item;
+            }
+        }
+    }
+    return NULL;
+}
+
+void CYsfProtocol::EncodePollPacket(CBuffer *buffer, const CCallsign &callsign) const
+{
+    uint8 tag[] = { 'Y','S','F','P' };
+    char cs[YSF_CALLSIGN_LENGTH];
+
+    // tag
+    buffer->Set(tag, sizeof(tag));
+
+    // callsign (10 bytes, space padded)
+    ::memset(cs, ' ', sizeof(cs));
+    callsign.GetCallsign((uint8 *)cs);
+    buffer->Append((uint8 *)cs, YSF_CALLSIGN_LENGTH);
 }

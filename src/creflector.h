@@ -25,12 +25,15 @@
 #ifndef creflector_h
 #define creflector_h
 
+#include <atomic>
 #include "cusers.h"
 #include "cclients.h"
 #include "cpeers.h"
 #include "cprotocols.h"
 #include "cpacketstream.h"
 #include "cnotificationqueue.h"
+#include "cpendingentry.h"
+#include <mutex>
 
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -77,8 +80,13 @@ public:
     
     // stream opening & closing
     CPacketStream *OpenStream(CDvHeaderPacket *, CClient *);
-    bool IsStreaming(char);
     void CloseStream(CPacketStream *);
+
+    // late entry support
+    bool TryLateEntry(CDvHeaderPacket *, CClient *);
+    bool BufferPendingFrame(uint16 streamId, CPacket *frame);
+    CPacketStream *GetPromotedStream(uint16 streamId);
+    void CancelPendingEntry(uint16 streamId);
     
     // users
     CUsers  *GetUsers(void)                         { m_Users.Lock(); return &m_Users; }
@@ -95,17 +103,23 @@ public:
     void OnUsersChanged(void);
     void OnStreamOpen(const CCallsign &);
     void OnStreamClose(const CCallsign &);
-    
+
+    // streams - public for loop prevention in protocol handlers
+    CPacketStream *GetStream(char);
+    void           ReleaseStreamOwner(CClient *);
+
 protected:
     // threads
     static void RouterThread(CReflector *, CPacketStream *);
     static void XmlReportThread(CReflector *);
     static void JsonReportThread(CReflector *);
-    
+
     // streams
-    CPacketStream *GetStream(char);
     bool          IsStreamOpen(const CDvHeaderPacket *);
     char          GetStreamModule(CPacketStream *);
+
+    // late entry
+    void          PromotePendingEntry(int moduleIndex);
     
     // xml helpers
     void WriteXmlFile(std::ofstream &);
@@ -135,9 +149,13 @@ protected:
     
     // queues
     std::array<CPacketStream, NB_OF_MODULES> m_Streams;
+
+    // late entry pending entries (one per module)
+    std::array<CPendingEntry, NB_OF_MODULES> m_PendingEntries;
+    std::array<std::mutex, NB_OF_MODULES>    m_PendingMutex;
     
     // threads
-    bool            m_bStopThreads;
+    std::atomic<bool> m_bStopThreads;
     std::array<std::thread *, NB_OF_MODULES> m_RouterThreads;
     std::thread    *m_XmlReportThread;
     std::thread    *m_JsonReportThread;

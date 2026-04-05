@@ -26,9 +26,17 @@
 #ifndef cvocodecchannel_h
 #define cvocodecchannel_h
 
+#include <mutex>
+#include <queue>
+#include <vector>
+#include <thread>
+#include <condition_variable>
+#include <atomic>
 #include "cpacketqueue.h"
 #include "csignalprocessor.h"
 #include "cvoicepacket.h"
+#include "codec2/codec2.h"
+#include "imbe/imbe_vocoder.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // class
@@ -40,7 +48,7 @@ class CVocodecChannel
 public:
     // constructors
     CVocodecChannel(CVocodecInterface *, int, CVocodecInterface *, int, int);
-    
+
     // destructor
     virtual ~CVocodecChannel();
     
@@ -71,6 +79,18 @@ public:
     CPacketQueue *GetVoiceQueue(void)       { m_QueueVoice.Lock(); return &m_QueueVoice; }
     void ReleaseVoiceQueue(void)            { m_QueueVoice.Unlock(); }
 
+    // Codec2 queue (for software-encoded Codec2 data)
+    void EnableCodec2(bool bEnable);
+    bool HasCodec2Data(void);
+    bool GetCodec2Data(uint8 *codec2);
+    bool IsCodec2Enabled(void) const        { return m_bCodec2Enabled; }
+
+    // IMBE queue (for software-encoded IMBE data)
+    void EnableImbe(bool bEnable);
+    bool HasImbeData(void);
+    bool GetImbeData(uint8 *imbe);
+    bool IsImbeEnabled(void) const          { return m_bImbeEnabled; }
+
     // operators
     //virtual bool operator ==(const CVocodecChannel &) const   { return false; }
     
@@ -80,7 +100,7 @@ protected:
     
 protected:
     // status
-    bool                m_bOpen;
+    std::atomic<bool>   m_bOpen;
 
     // connected interfaces
     CVocodecInterface   *m_InterfaceIn;
@@ -96,7 +116,37 @@ protected:
     
     // settings
     int                 m_iSpeechGain;
-    
+
+    // Codec2 encoding (software) - runs in separate thread to avoid blocking hardware
+    std::atomic<bool>   m_bCodec2Enabled;
+    CCodec2             *m_pCodec2;
+    std::mutex          m_Codec2Mutex;
+    std::queue<std::vector<uint8>> m_Codec2Queue;
+
+    // Async Codec2 encoding thread
+    std::thread         *m_pCodec2Thread;
+    std::atomic<bool>   m_bCodec2StopThread;
+    std::mutex          m_Codec2PcmMutex;
+    std::condition_variable m_Codec2PcmCondition;
+    std::queue<std::vector<int16_t>> m_Codec2PcmQueue;  // PCM samples waiting to be encoded
+    static void Codec2EncoderThread(CVocodecChannel *pChannel);
+    void Codec2EncoderTask(void);
+
+    // IMBE encoding (software) - runs in separate thread to avoid blocking hardware
+    std::atomic<bool>   m_bImbeEnabled;
+    imbe_vocoder        *m_pImbe;
+    std::mutex          m_ImbeMutex;
+    std::queue<std::vector<uint8>> m_ImbeQueue;
+
+    // Async IMBE encoding thread
+    std::thread         *m_pImbeThread;
+    std::atomic<bool>   m_bImbeStopThread;
+    std::mutex          m_ImbePcmMutex;
+    std::condition_variable m_ImbePcmCondition;
+    std::queue<std::vector<int16_t>> m_ImbePcmQueue;  // PCM samples waiting to be encoded
+    static void ImbeEncoderThread(CVocodecChannel *pChannel);
+    void ImbeEncoderTask(void);
+
 private:
     CSignalProcessor* m_signalProcessor;
 };

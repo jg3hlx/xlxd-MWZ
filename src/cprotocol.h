@@ -25,6 +25,9 @@
 #ifndef cprotocol_h
 #define cprotocol_h
 
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include "cudpsocket.h"
 #include "cpacketstream.h"
 #include "cdvheaderpacket.h"
@@ -81,14 +84,20 @@ public:
     
     // queue
     CPacketQueue *GetQueue(void)        { m_Queue.Lock(); return &m_Queue; }
-    void ReleaseQueue(void)             { m_Queue.Unlock(); }
-    
+    void ReleaseQueue(void)             { m_Queue.Unlock(); m_QueueCondVar.notify_one(); }
+
     // get
     const CCallsign &GetReflectorCallsign(void)const { return m_ReflectorCallsign; }
-    
-    // task
-    static void Thread(CProtocol *);
+
+    // task — legacy single-thread mode (used by unconverted protocols)
+    static void RxThread(CProtocol *);
+    static void TxThread(CProtocol *);
     virtual void Task(void) {};
+
+    // split-thread mode — override these plus UsesSplitThreads() to enable
+    virtual bool UsesSplitThreads(void) const { return false; }
+    virtual void RxTask(void) {}
+    virtual void TxTask(void);
     
 protected:
     // packet encoding helpers
@@ -101,7 +110,8 @@ protected:
     virtual bool OnDvHeaderPacketIn(CDvHeaderPacket *, const CIp &) { return false; }
     virtual void OnDvFramePacketIn(CDvFramePacket *, const CIp * = NULL);
     virtual void OnDvLastFramePacketIn(CDvLastFramePacket *, const CIp * = NULL);
-    
+    void HandleStreamLastFrame(CPacketStream *, CDvLastFramePacket *);
+
     // stream handle helpers
     CPacketStream *GetStream(uint16, const CIp * = NULL);
     void CheckStreamsTimeout(void);
@@ -131,9 +141,15 @@ protected:
     // queue
     CPacketQueue    m_Queue;
     
-    // thread
-    bool            m_bStopThread;
-    std::thread     *m_pThread;
+    // threads
+    std::atomic<bool> m_bStopThread;     // RX thread stop (also used by legacy single-thread)
+    std::atomic<bool> m_bStopTxThread;   // TX thread stop
+    std::thread     *m_pThread;          // RX thread (or legacy single thread)
+    std::thread     *m_pTxThread;        // TX thread (NULL in legacy mode)
+
+    // TX thread wake-up
+    std::condition_variable m_QueueCondVar;
+    std::mutex              m_QueueCondMutex;
     
     // identity
     CCallsign       m_ReflectorCallsign;

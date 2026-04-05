@@ -29,9 +29,14 @@
 #include "cip.h"
 #include "ccallsign.h"
 #include "cbuffer.h"
+#include <random>
 
 ////////////////////////////////////////////////////////////////////////////////////////
-//
+// defines
+
+// Jitter ranges for staggering keepalives and connection acks
+#define KEEPALIVE_JITTER_MAX        5.0    // seconds - max random delay for first outbound keepalive
+#define CONNECT_ACK_JITTER_MAX      2.0    // seconds - max random delay for connection ack
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // class
@@ -79,6 +84,16 @@ public:
     virtual void SetMasterOfModule(char c)              { m_ModuleMastered = c; }
     virtual void NotAMaster(void)                       { m_ModuleMastered = ' '; }
     virtual void Heard(void)                            { m_LastHeardTime = std::time(NULL); }
+
+    // keepalive scheduling (for outbound keepalives from reflector)
+    double GetNextKeepaliveTime(void) const             { return m_NextKeepaliveTime; }
+    void SetNextKeepaliveTime(double t)                 { m_NextKeepaliveTime = t; }
+    void ScheduleNextKeepalive(double period)           { m_NextKeepaliveTime = period; }
+    bool IsKeepaliveDue(void) const                     { return m_KeepaliveTimer.DurationSinceNow() >= m_NextKeepaliveTime; }
+    void ResetKeepaliveTimer(void)                      { m_KeepaliveTimer.Now(); }
+
+    // static helper for random jitter
+    static double GetRandomJitter(double maxJitter);
     
     // reporting
     virtual void WriteXml(std::ofstream &);
@@ -88,7 +103,7 @@ protected:
     // data
     CCallsign   m_Callsign;
     CIp         m_Ip;
-    
+
     // linked to
     char        m_ReflectorModule;
 
@@ -97,6 +112,10 @@ protected:
     CTimePoint  m_LastKeepaliveTime;
     std::time_t m_ConnectTime;
     std::time_t m_LastHeardTime;
+
+    // outbound keepalive scheduling (for staggering keepalives to clients)
+    CTimePoint  m_KeepaliveTimer;       // when timer was last reset
+    double      m_NextKeepaliveTime;    // seconds until next outbound keepalive
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////

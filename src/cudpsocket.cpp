@@ -53,7 +53,7 @@ CUdpSocket::~CUdpSocket()
 bool CUdpSocket::Open(uint16 uiPort)
 {
     bool open = false;
-    
+
     // create socket
     m_Socket = socket(PF_INET,SOCK_DGRAM,0);
     if ( m_Socket != -1 )
@@ -63,10 +63,18 @@ bool CUdpSocket::Open(uint16 uiPort)
         m_SocketAddr.sin_family = AF_INET;
         m_SocketAddr.sin_port = htons(uiPort);
         m_SocketAddr.sin_addr.s_addr = inet_addr(g_Reflector.GetListenIp());
-        
+
         if ( bind(m_Socket, (struct sockaddr *)&m_SocketAddr, sizeof(struct sockaddr_in)) == 0 )
         {
             fcntl(m_Socket, F_SETFL, O_NONBLOCK);
+
+            // set DSCP TOS once at socket open (avoids per-packet setsockopt in SendVoice)
+            if ( DSCP_VALUE >= 0 && DSCP_VALUE <= 63 )
+            {
+                int tos = DSCP_VALUE << 2;
+                setsockopt(m_Socket, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+            }
+
             open = true;
         }
         else
@@ -75,7 +83,7 @@ bool CUdpSocket::Open(uint16 uiPort)
             m_Socket = -1;
         }
     }
-    
+
     // done
     return open;
 }
@@ -138,6 +146,7 @@ int CUdpSocket::Receive(CBuffer *Buffer, CIp *Ip, int timeout)
 
 int CUdpSocket::Send(const CBuffer &Buffer, const CIp &Ip)
 {
+    if ( m_Socket == -1 ) return -1;
     CIp temp(Ip);
     return (int)::sendto(m_Socket,
            (void *)Buffer.data(), Buffer.size(),
@@ -146,6 +155,7 @@ int CUdpSocket::Send(const CBuffer &Buffer, const CIp &Ip)
 
 int CUdpSocket::Send(const char *Buffer, const CIp &Ip)
 {
+    if ( m_Socket == -1 ) return -1;
     CIp temp(Ip);
     return (int)::sendto(m_Socket,
            (void *)Buffer, ::strlen(Buffer),
@@ -154,6 +164,7 @@ int CUdpSocket::Send(const char *Buffer, const CIp &Ip)
 
 int CUdpSocket::Send(const CBuffer &Buffer, const CIp &Ip, uint16 destport)
 {
+    if ( m_Socket == -1 ) return -1;
     CIp temp(Ip);
     temp.GetSockAddr()->sin_port = htons(destport);
     return (int)::sendto(m_Socket,
@@ -163,11 +174,93 @@ int CUdpSocket::Send(const CBuffer &Buffer, const CIp &Ip, uint16 destport)
 
 int CUdpSocket::Send(const char *Buffer, const CIp &Ip, uint16 destport)
 {
+    if ( m_Socket == -1 ) return -1;
     CIp temp(Ip);
     temp.GetSockAddr()->sin_port = htons(destport);
     return (int)::sendto(m_Socket,
                          (void *)Buffer, ::strlen(Buffer),
                          0, (struct sockaddr *)temp.GetSockAddr(), sizeof(struct sockaddr_in));
 }
+
+////////////////////////////////////////////////////////////////////////////////////////
+// write - voice packets with DSCP marking
+
+#if (DSCP_MARKING_ENABLE == 1)
+// Single global flag for DSCP logging - shared across all SendVoice calls
+static std::atomic<bool> g_bDscpLogged(false);
+
+int CUdpSocket::SendVoice(const CBuffer &Buffer, const CIp &Ip)
+{
+    if ( m_Socket == -1 ) return -1;
+    // DSCP TOS is set once at socket open — no per-call setsockopt needed
+
+    CIp temp(Ip);
+    int result;
+    int retries = 0;
+    do
+    {
+        result = (int)::sendto(m_Socket,
+               (void *)Buffer.data(), Buffer.size(),
+               0, (struct sockaddr *)temp.GetSockAddr(), sizeof(struct sockaddr_in));
+        int saved_errno = errno;
+        if ( result == -1 && saved_errno == EAGAIN && retries < 5 )
+        {
+            usleep(1000);  // 1ms backoff to let kernel flush send buffer
+            retries++;
+        }
+        else
+        {
+            break;
+        }
+    } while ( true );
+
+    return result;
+}
+
+int CUdpSocket::SendVoice(const CBuffer &Buffer, const CIp &Ip, uint16 destport)
+{
+    if ( m_Socket == -1 ) return -1;
+    // DSCP TOS is set once at socket open — no per-call setsockopt needed
+
+    CIp temp(Ip);
+    temp.GetSockAddr()->sin_port = htons(destport);
+    int result;
+    int retries = 0;
+    do
+    {
+        result = (int)::sendto(m_Socket,
+                         (void *)Buffer.data(), Buffer.size(),
+                         0, (struct sockaddr *)temp.GetSockAddr(), sizeof(struct sockaddr_in));
+        int saved_errno = errno;
+        if ( result == -1 && saved_errno == EAGAIN && retries < 5 )
+        {
+            usleep(1000);
+            retries++;
+        }
+        else
+        {
+            break;
+        }
+    } while ( true );
+
+    return result;
+}
+
+void CUdpSocket::LogDscpStatus(void)
+{
+    if ( !g_bDscpLogged )
+    {
+        if ( DSCP_VALUE >= 0 && DSCP_VALUE <= 63 )
+        {
+            std::cout << "Voice packets marked as DSCP " << DSCP_VALUE << std::endl;
+        }
+        else
+        {
+            std::cout << "Error: Invalid DSCP_VALUE " << DSCP_VALUE << " (must be 0-63), QoS disabled" << std::endl;
+        }
+        g_bDscpLogged = true;
+    }
+}
+#endif
 
 
