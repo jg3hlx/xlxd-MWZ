@@ -104,8 +104,27 @@ void CNxdnProtocol::RxTask(void)
 
                 if ( peer != NULL )
                 {
-                    // get stream id
-                    uint32 uiStreamId = IpToStreamId(Ip);
+                    // Lock order: Peers → m_SourceStatesMutex. The Allocate /
+                    // Lookup / Release helpers below take m_SourceStatesMutex
+                    // internally while we still hold the Peers lock acquired
+                    // at line 103. Do NOT add code that takes a reflector
+                    // lock (Peers, Clients, etc.) inside any helper that
+                    // also takes m_SourceStatesMutex — that would invert
+                    // this order and risk deadlock.
+                    //
+                    // get stream id — header allocates fresh, voice and
+                    // trailer look up the active mapping. See the helper
+                    // comments in cnxdnprotocol.h for why deterministic
+                    // IpToStreamId() collides on rapid re-keys.
+                    uint32 uiStreamId;
+                    if ( uiFlags & NXDN_FLAG_HEADER )
+                    {
+                        uiStreamId = AllocateNewStreamIdForSource(Ip);
+                    }
+                    else
+                    {
+                        uiStreamId = LookupStreamIdForSource(Ip);
+                    }
 
                     if ( uiFlags & NXDN_FLAG_HEADER )
                     {
@@ -135,8 +154,14 @@ void CNxdnProtocol::RxTask(void)
                             module = peer->GetClient(0)->GetReflectorModule();
                         }
 
-                        CCallsign rpt1 = m_ReflectorCallsign;
-                        rpt1.SetModule(module);
+                        // RPT1 uses the caller's own callsign with 'B' — matches
+                        // the D-Star hotspot convention (DVAP/Pi-Star/MMDVM/openSPOT
+                        // all stamp RPT1 as "<user> B"). This makes cross-mode
+                        // traffic indistinguishable from a legitimate D-Star hotspot
+                        // transmission, so strict receivers (Icom G3 gateways) accept
+                        // it rather than rejecting on an unknown-repeater lookup.
+                        CCallsign rpt1 = csMY;
+                        rpt1.SetModule('B');
                         CCallsign rpt2 = m_ReflectorCallsign;
                         rpt2.SetModule('G');
 
@@ -167,6 +192,15 @@ void CNxdnProtocol::RxTask(void)
                             ::memset(uiAmbe, 0x00, sizeof(uiAmbe));
                             deferredLastFrame = new CDvLastFramePacket(uiAmbe, uiStreamId, (uint8)0, (uint8)0, (uint8)0);
                         }
+                        // Drop the IP→sid mapping unconditionally — the next
+                        // header from this source allocates fresh. NXDN radios
+                        // commonly emit the trailer flag on multiple frames at
+                        // end-of-transmission for redundancy; first call here
+                        // releases, subsequent trailers fall back to the
+                        // deterministic IpToStreamId() which won't match any
+                        // open stream and so are dropped harmlessly in
+                        // CProtocol::OnDvLastFramePacketIn.
+                        ReleaseStreamIdForSource(Ip);
                     }
                     else
                     {
@@ -1087,4 +1121,74 @@ uint32 CNxdnProtocol::IpToStreamId(const CIp &ip) const
 {
     // XOR port into both halves to distinguish localhost peers on different ports
     return ip.GetAddr() ^ (uint32)(MAKEDWORD(ip.GetPort(), ip.GetPort()));
+}
+
+// Build the map key. (addr<<16)|port keeps the same source endpoint
+// keyed identically for header / voice / trailer frames within one
+// transmission, and distinguishes localhost peers using different
+// ephemeral ports.
+static inline uint64_t NxdnSourceKey(const CIp &ip)
+{
+    return ((uint64_t)ip.GetAddr() << 16) | (uint64_t)(ip.GetPort() & 0xFFFFu);
+}
+
+// Allocate a fresh reflector-side stream-id for a NEW header arrival.
+// Uses the process-wide CProtocol::AllocateGlobalStreamIdNonce — see
+// cprotocol.cpp for the rationale (random seed at startup, shared
+// across protocols to avoid inter-protocol sid collisions). The
+// per-protocol collision-against-m_SourceStates check is kept as
+// defence-in-depth for the rare wrap-around case.
+uint32 CNxdnProtocol::AllocateNewStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+
+    const uint64_t key = NxdnSourceKey(ip);
+
+    for (int attempts = 0; attempts < 65535; attempts++)
+    {
+        uint32 candidate = (uint32)AllocateGlobalStreamIdNonce();
+
+        bool collision = false;
+        for (const auto &entry : m_SourceStates)
+        {
+            if (entry.first != key && entry.second == candidate)
+            {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision)
+        {
+            m_SourceStates[key] = candidate;
+            return candidate;
+        }
+    }
+
+    // Pathological fallback (would need 65535 simultaneous active sources).
+    uint32 fallback = IpToStreamId(ip);
+    m_SourceStates[key] = fallback;
+    return fallback;
+}
+
+// Look up the active sid for a voice or trailer frame. Falls back to
+// the deterministic IpToStreamId() when no header has been seen for
+// this source — preserves the late-entry buffering path in
+// CProtocol::OnDvFramePacketIn for orphan mid-stream packets.
+uint32 CNxdnProtocol::LookupStreamIdForSource(const CIp &ip) const
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    auto it = m_SourceStates.find(NxdnSourceKey(ip));
+    if (it != m_SourceStates.end())
+    {
+        return it->second;
+    }
+    return IpToStreamId(ip);
+}
+
+// Drop the IP→sid mapping after the trailer is processed. The next
+// header from this source will allocate a fresh sid.
+void CNxdnProtocol::ReleaseStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    m_SourceStates.erase(NxdnSourceKey(ip));
 }

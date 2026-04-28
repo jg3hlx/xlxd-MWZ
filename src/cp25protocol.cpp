@@ -260,8 +260,31 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
         return;
     }
 
-    uint32 uiStreamId = IpToStreamId(Ip);
     uint8 cmd = Buffer.data()[0];
+
+    // Lock order: Peers (acquired/released above for the peer check) →
+    // m_SourceStatesMutex (taken inside the Allocate/Lookup helpers).
+    // No reflector lock is held here at the call sites below, but if a
+    // future change adds one, do NOT take m_SourceStatesMutex first and
+    // then call into the reflector — that would invert this order and
+    // risk deadlock with the OnTerminatorPacketIn path which holds Peers
+    // while calling Lookup/Release.
+    //
+    // Allocate / look up the reflector-side stream-id. P25 uses LDU1
+    // Voice1 (0x62) as the implicit start-of-transmission marker (the
+    // existing pending-header logic below also keys on this), so that's
+    // where we allocate a fresh sid. All other LDU records look up the
+    // active mapping. See the helper comments in cp25protocol.h for the
+    // full motivation.
+    uint32 uiStreamId;
+    if ( cmd == P25_REC_LDU1_VOICE1 )
+    {
+        uiStreamId = AllocateNewStreamIdForSource(Ip);
+    }
+    else
+    {
+        uiStreamId = LookupStreamIdForSource(Ip);
+    }
 
     // Extract IMBE frame based on record type
     uint8 uiImbe[P25_IMBE_SIZE];
@@ -341,8 +364,10 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
                 csMY.SetCallsign(szCallsign);
             }
 
-            CCallsign rpt1 = m_ReflectorCallsign;
-            rpt1.SetModule(module);
+            // RPT1 uses caller's callsign + 'B' — D-Star hotspot convention.
+            // See cnxdnprotocol.cpp for the rationale.
+            CCallsign rpt1 = csMY;
+            rpt1.SetModule('B');
             CCallsign rpt2 = m_ReflectorCallsign;
             rpt2.SetModule('G');
 
@@ -391,6 +416,11 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
 
 void CP25Protocol::OnTerminatorPacketIn(const CIp &Ip)
 {
+    // Lock order: Peers → m_SourceStatesMutex. Lookup and Release are
+    // called below while the Peers lock acquired here is still held.
+    // Same caveat as OnLduPacketIn — do not call into the reflector
+    // from inside the Allocate/Lookup/Release helpers, since that would
+    // invert this order.
     CPeers *peers = g_Reflector.GetPeers();
     CPeer *peer = peers->FindPeer(Ip, PROTOCOL_P25);
 
@@ -409,7 +439,7 @@ void CP25Protocol::OnTerminatorPacketIn(const CIp &Ip)
             m_StreamsCache[iModId].ClearPendingFrames();
         }
 
-        uint32 uiStreamId = IpToStreamId(Ip);
+        uint32 uiStreamId = LookupStreamIdForSource(Ip);
         CPacketStream *stream = GetStream(uiStreamId);
         if ( stream != NULL )
         {
@@ -417,10 +447,20 @@ void CP25Protocol::OnTerminatorPacketIn(const CIp &Ip)
             ::memset(emptyImbe, 0, sizeof(emptyImbe));
             CDvLastFramePacket *lastFrame = new CDvLastFramePacket(emptyImbe, uiStreamId, (uint8)0, (uint8)0, (uint8)0);
 
+            // Drop the IP→sid mapping unconditionally — the next
+            // start-of-transmission (LDU1 Voice1) from this source will
+            // allocate a fresh sid. Done before releasing peers so we
+            // can't take the OnDvLastFramePacketIn path with a stale
+            // mapping if peers-release races with another inbound TDU.
+            ReleaseStreamIdForSource(Ip);
+
             g_Reflector.ReleasePeers();
             OnDvLastFramePacketIn(lastFrame, &Ip);
             return;
         }
+        // No matching stream — still release the mapping so a duplicate
+        // TDU doesn't leave a stale sid pinned for this source.
+        ReleaseStreamIdForSource(Ip);
     }
     g_Reflector.ReleasePeers();
 }
@@ -1198,4 +1238,74 @@ uint32 CP25Protocol::IpToStreamId(const CIp &ip) const
 {
     // XOR port into both halves to distinguish localhost peers on different ports
     return ip.GetAddr() ^ (uint32)(MAKEDWORD(ip.GetPort(), ip.GetPort()));
+}
+
+// Build the map key. (addr<<16)|port keeps the same source endpoint
+// keyed identically for header / voice / TDU frames within one
+// transmission, and distinguishes localhost peers using different
+// ephemeral ports.
+static inline uint64_t P25SourceKey(const CIp &ip)
+{
+    return ((uint64_t)ip.GetAddr() << 16) | (uint64_t)(ip.GetPort() & 0xFFFFu);
+}
+
+// Allocate a fresh reflector-side stream-id for a NEW transmission
+// (LDU1 Voice1). Uses the process-wide CProtocol::AllocateGlobalStreamIdNonce
+// — see cprotocol.cpp for the rationale (random seed at startup,
+// shared across protocols to avoid inter-protocol sid collisions).
+// The per-protocol collision-against-m_SourceStates check is kept as
+// defence-in-depth for the rare wrap-around case.
+uint32 CP25Protocol::AllocateNewStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+
+    const uint64_t key = P25SourceKey(ip);
+
+    for (int attempts = 0; attempts < 65535; attempts++)
+    {
+        uint32 candidate = (uint32)AllocateGlobalStreamIdNonce();
+
+        bool collision = false;
+        for (const auto &entry : m_SourceStates)
+        {
+            if (entry.first != key && entry.second == candidate)
+            {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision)
+        {
+            m_SourceStates[key] = candidate;
+            return candidate;
+        }
+    }
+
+    // Pathological fallback (would need 65535 simultaneous active sources).
+    uint32 fallback = IpToStreamId(ip);
+    m_SourceStates[key] = fallback;
+    return fallback;
+}
+
+// Look up the active sid for a non-Voice1 LDU frame or a TDU. Falls
+// back to the deterministic IpToStreamId() when no header has been
+// seen for this source — preserves the late-entry buffering path in
+// CProtocol::OnDvFramePacketIn for orphan mid-stream packets.
+uint32 CP25Protocol::LookupStreamIdForSource(const CIp &ip) const
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    auto it = m_SourceStates.find(P25SourceKey(ip));
+    if (it != m_SourceStates.end())
+    {
+        return it->second;
+    }
+    return IpToStreamId(ip);
+}
+
+// Drop the IP→sid mapping after the TDU is processed. The next LDU1
+// Voice1 from this source will allocate a fresh sid.
+void CP25Protocol::ReleaseStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    m_SourceStates.erase(P25SourceKey(ip));
 }

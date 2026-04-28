@@ -464,14 +464,24 @@ void CXlxProtocol::HandlePeerLinks(void)
 bool CXlxProtocol::OnDvHeaderPacketIn(CDvHeaderPacket *Header, const CIp &Ip)
 {
     bool newstream = false;
+    bool lastheard = false;
     CCallsign peer;
-    
+
+    // Snapshot header fields for the Hearing() call at the end. OpenStream
+    // consumes the Header pointer on success (deletes it after copying into
+    // the stream), so we cannot safely dereference `Header` after that call.
+    // Every other protocol uses the same local-snapshot pattern — see
+    // e.g. cdmrmmdvmprotocol.cpp:365-370.
+    CCallsign myCallsign   = Header->GetMyCallsign();
+    CCallsign rpt1Callsign = Header->GetRpt1Callsign();
+    CCallsign rpt2Callsign = Header->GetRpt2Callsign();
+
     // todo: verify Packet.GetModuleId() is in authorized list of XLX of origin
     // todo: do the same for DVFrame and DVLAstFrame packets
 
     // tag packet as remote peer origin
     Header->SetRemotePeerOrigin();
-    
+
     // find the stream (match on both StreamId and IP to avoid false matches)
     CPacketStream *stream = GetStream(Header->GetStreamId(), &Ip);
     if ( stream == NULL )
@@ -481,34 +491,64 @@ bool CXlxProtocol::OnDvHeaderPacketIn(CDvHeaderPacket *Header, const CIp &Ip)
         CClient *client = g_Reflector.GetClients()->FindClient(Ip, PROTOCOL_XLX, Header->GetRpt2Module());
         if ( client != NULL )
         {
+            // Snapshot the peer callsign BEFORE OpenStream — OpenStream may
+            // release and re-acquire the Clients lock during its transcoder
+            // handshake, after which `client` is not safe to dereference.
+            peer = client->GetCallsign();
+
             // and try to open the stream
             if ( (stream = g_Reflector.OpenStream(Header, client)) != NULL )
             {
                 // keep the handle
                 m_Streams.push_back(stream);
                 newstream = true;
+                lastheard = true;
+                // OpenStream consumes the caller's pointer on success — null
+                // our local so the end-of-function cleanup doesn't double-free.
+                Header = NULL;
             }
             else if ( g_Reflector.TryLateEntry(Header, client) )
             {
                 Header = NULL;  // ownership transferred
+                // NOT setting lastheard here — matches pre-squash behavior,
+                // which skipped Hearing() on late-entry because its
+                // `if (Header != NULL)` guard was already false after the
+                // ownership transfer.
             }
-            // get origin
-            peer = client->GetCallsign();
+            else
+            {
+                // open and late-entry both failed — still counted as heard
+                // in the pre-squash code (Header still non-NULL at guard).
+                lastheard = true;
+            }
+        }
+        else
+        {
+            // no client found — pre-squash counted this as heard too
+            // (Header still non-NULL, peer default/empty).
+            lastheard = true;
         }
         // release
         g_Reflector.ReleaseClients();
     }
     else
     {
-        // stream already open
-        // skip packet, but tickle the stream
+        // stream already open — duplicate header, tickle the stream.
+        // Pre-squash counted this as heard (Header still non-NULL, peer
+        // default/empty because client lookup is skipped in this branch).
+        // Note this diverges from CDextraProtocol (parent) which skips
+        // Hearing() on duplicate headers — intentional XLX behavior so
+        // long transmissions through XLX peers keep their heard-list
+        // timestamp fresh. Hearing() deduplicates via CUser::operator==
+        // and falls through to HeardNow() on the existing entry.
         stream->Tickle();
+        lastheard = true;
     }
 
     // update last heard
-    if ( Header != NULL )
+    if ( lastheard )
     {
-        g_Reflector.GetUsers()->Hearing(Header->GetMyCallsign(), Header->GetRpt1Callsign(), Header->GetRpt2Callsign(), peer);
+        g_Reflector.GetUsers()->Hearing(myCallsign, rpt1Callsign, rpt2Callsign, peer);
         g_Reflector.ReleaseUsers();
     }
 
@@ -517,7 +557,7 @@ bool CXlxProtocol::OnDvHeaderPacketIn(CDvHeaderPacket *Header, const CIp &Ip)
     {
         delete Header;
     }
-    
+
     // done
     return newstream;
 }

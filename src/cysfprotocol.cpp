@@ -808,9 +808,11 @@ bool CYsfProtocol::IsValidDvHeaderPacket(const CIp &Ip, const CYSFFICH &Fich, co
     // DV header ?
     if ( Fich.getFI() == YSF_FI_HEADER )
     {
-        // get stream id
-        uint32 uiStreamId = IpToStreamId(Ip);
-        
+        // Allocate a fresh stream-id for this new transmission. Releases
+        // any stale mapping for this source from a prior over that may
+        // still be draining; see AllocateNewStreamIdForSource().
+        uint32 uiStreamId = AllocateNewStreamIdForSource(Ip);
+
         // get header data
         CYSFPayload ysfPayload;
         if ( ysfPayload.processHeaderData((unsigned char *)&(Buffer.data()[35])) )
@@ -833,8 +835,10 @@ bool CYsfProtocol::IsValidDvHeaderPacket(const CIp &Ip, const CYSFFICH &Fich, co
             }
             g_Reflector.ReleasePeers();
 
-            CCallsign rpt1 = m_ReflectorCallsign;
-            rpt1.SetModule(ysfModule);
+            // RPT1 uses caller's callsign + 'B' — D-Star hotspot convention.
+            // See cnxdnprotocol.cpp for the rationale.
+            CCallsign rpt1 = csMY;
+            rpt1.SetModule('B');
             CCallsign rpt2 = m_ReflectorCallsign;
             rpt2.SetModule('G');
             
@@ -885,9 +889,11 @@ bool CYsfProtocol::IsValidDvFramePacket(const CIp &Ip, const CYSFFICH &Fich, con
     // is it DV frame ?
     if ( Fich.getFI() == YSF_FI_COMMUNICATIONS )
     {
-        // get stream id
-        uint32 uiStreamId = IpToStreamId(Ip);
-        
+        // Use the active per-source mapping (set by the most recent
+        // header from this Ip). Falls back to the deterministic hash
+        // for orphan mid-stream packets, preserving late-entry buffering.
+        uint32 uiStreamId = LookupStreamIdForSource(Ip);
+
         // get DV frames
         uint8   ambe0[AMBEPLUS_SIZE];
         uint8   ambe1[AMBEPLUS_SIZE];
@@ -947,9 +953,18 @@ bool CYsfProtocol::IsValidDvLastFramePacket(const CIp &Ip, const CYSFFICH &Fich,
     // DV header ?
     if ( Fich.getFI() == YSF_FI_TERMINATOR )
     {
-        // get stream id
-        uint32 uiStreamId = IpToStreamId(Ip);
-        
+        // Use the active per-source mapping. Drop the mapping after we
+        // build the LastFramePacket so the next header arrival from this
+        // source allocates a fresh sid. NB: real YSF radios commonly
+        // emit 1-3 terminator FICH frames at end-of-transmission for
+        // redundancy. The first call here releases the mapping; the
+        // second/third terminators fall back to the deterministic hash
+        // (which won't match any open stream because OnDvLastFramePacketIn
+        // already closed it), so they route into the late-entry / cancel
+        // path in CProtocol::OnDvLastFramePacketIn and get dropped — no
+        // duplicate EoT can reach DCS egress.
+        uint32 uiStreamId = LookupStreamIdForSource(Ip);
+
         // get DV frames
         {
             uint8  uiAmbe[AMBE_SIZE];
@@ -961,7 +976,7 @@ bool CYsfProtocol::IsValidDvLastFramePacket(const CIp &Ip, const CYSFFICH &Fich,
         // check validity of packets
         if ( (frames[0] == NULL) || !(frames[0]->IsValid()) ||
              (frames[1] == NULL) || !(frames[1]->IsValid()) )
-            
+
         {
             delete frames[0];
             delete frames[1];
@@ -972,8 +987,14 @@ bool CYsfProtocol::IsValidDvLastFramePacket(const CIp &Ip, const CYSFFICH &Fich,
         {
             valid = true;
         }
+
+        // The terminator frame consumed this source's sid mapping —
+        // drop it so the next header allocates fresh. Done unconditionally
+        // (regardless of frame validity) because a malformed terminator
+        // FICH still marks the end of this transmission from the source.
+        ReleaseStreamIdForSource(Ip);
     }
-    
+
     // done
     return valid;
 }
@@ -1370,11 +1391,86 @@ uint32 CYsfProtocol::CalcHash(const uint8 *buffer, int len) const
 ////////////////////////////////////////////////////////////////////////////////////////
 // uiStreamId helpers
 
-
-// uiStreamId helpers
 uint32 CYsfProtocol::IpToStreamId(const CIp &ip) const
 {
     return ip.GetAddr() ^ (uint32)(MAKEDWORD(ip.GetPort(), ip.GetPort()));
+}
+
+// Build the map key. (addr<<16)|port keeps the same source endpoint
+// keyed identically for header / voice / terminator frames within one
+// transmission, and distinguishes localhost peers using different
+// ephemeral ports.
+static inline uint64_t YsfSourceKey(const CIp &ip)
+{
+    return ((uint64_t)ip.GetAddr() << 16) | (uint64_t)(ip.GetPort() & 0xFFFFu);
+}
+
+// Allocate a fresh reflector-side stream-id for a NEW header arrival.
+// Pulls the nonce from the process-wide CProtocol::AllocateGlobalStreamIdNonce
+// — see cprotocol.cpp for the rationale (random seed at startup, shared
+// across protocols to avoid inter-protocol sid collisions). Defensively
+// retries if the candidate happens to collide with another live source's
+// mapped sid in THIS protocol's m_SourceStates (only possible across a
+// 65535-allocation wraparound where an earlier entry was never released
+// — bounded growth on dropped terminators, see header comment).
+uint32 CYsfProtocol::AllocateNewStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+
+    const uint64_t key = YsfSourceKey(ip);
+
+    // Try up to 65535 attempts; in practice the first attempt almost
+    // always succeeds because the active-source set is small.
+    for (int attempts = 0; attempts < 65535; attempts++)
+    {
+        uint32 candidate = (uint32)AllocateGlobalStreamIdNonce();
+
+        bool collision = false;
+        for (const auto &entry : m_SourceStates)
+        {
+            if (entry.first != key && entry.second == candidate)
+            {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision)
+        {
+            m_SourceStates[key] = candidate;
+            return candidate;
+        }
+    }
+
+    // Pathological fallback (would require 65535 simultaneous active
+    // sources within this protocol, which is impossible on a single
+    // UDP port). Fall back to the deterministic hash so we still
+    // produce SOMETHING valid.
+    uint32 fallback = IpToStreamId(ip);
+    m_SourceStates[key] = fallback;
+    return fallback;
+}
+
+// Look up the active sid for an inbound voice / terminator frame.
+// Falls back to the deterministic IpToStreamId() when no header has
+// been seen for this source — preserves the late-entry buffering path
+// in CProtocol::OnDvFramePacketIn for orphan mid-stream packets.
+uint32 CYsfProtocol::LookupStreamIdForSource(const CIp &ip) const
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    auto it = m_SourceStates.find(YsfSourceKey(ip));
+    if (it != m_SourceStates.end())
+    {
+        return it->second;
+    }
+    return IpToStreamId(ip);
+}
+
+// Drop the IP→sid mapping after the terminator frame is constructed.
+// The next header from this source will allocate a fresh sid.
+void CYsfProtocol::ReleaseStreamIdForSource(const CIp &ip)
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    m_SourceStates.erase(YsfSourceKey(ip));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////

@@ -31,6 +31,12 @@
 #include "csemaphore.h"
 #include "cudpsocket.h"
 #include "cpacketqueue.h"
+#include "cdstarslowdata.h"
+
+////////////////////////////////////////////////////////////////////////////////////////
+// forward declarations
+
+class CDvFramePacket;  // pointer-only use for m_pLastVoiceInJitter
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // define
@@ -95,6 +101,7 @@ public:
     uint32 GetTimeoutPackets(void) const    { return m_uiTimeoutPackets; }
     uint32 GetReturnedPackets(void) const   { return m_uiReturnedPackets; }
     bool   IsEmpty(void) const;
+    size_t GetDepth(void) const;
 
     // task
     static void Thread(CCodecStream *);
@@ -154,6 +161,65 @@ protected:
     // pushed to the packet stream. Prevents IsEmpty() from returning true
     // during the Phase 2 gap between jitter-pop and stream-push.
     std::atomic<int> m_iInFlightPackets;
+
+    // D-Star slow-data synthesiser. Only used on AMBE+ egress (i.e. when
+    // transcoding from a non-D-Star source to D-Star). For every AMBE+
+    // output frame, the Task() loop stamps either the sync marker (frame
+    // 0 of the 21-frame cycle) or 3 bytes of scrambled slow-data (frames
+    // 1–20) into the outgoing DvData field. Initialised lazily on the
+    // first transcoded frame via InitSlowData().
+    CDStarSlowData  m_SlowData;
+    bool            m_bSlowDataInit;
+
+    // Cycle index for slow-data scheduling. Cycle 0 carries the text
+    // message (BeginTextCycle); cycles 1+ carry header-sync continuously
+    // (BeginHeaderCycle), matching the native D-Star radio pattern
+    // confirmed by multi-cycle pcap of a Pi-Star source. Incremented on
+    // each sync-frame boundary in Task(); reset to 0 by InitSlowData()
+    // at the start of each stream.
+    uint32          m_uiSlowDataCycle;
+
+    // Pre-EoT slow-data marker support (all egress paths).
+    //
+    // Native D-Star radios emit a specific slow-data pattern in the
+    // slow-data slot of the last voice frame immediately before the EoT
+    // frame: wire bytes 0x55 0x55 0x55 (plaintext 0x25 0x1A 0xC6, the
+    // mirror of the EoT frame's own slow-data pattern). Strict Icom
+    // decoders (RP2C via g2_link) appear to use this as the "stream is
+    // about to close cleanly" signal; without it, subsequent TXs can be
+    // rejected/muted until the RP2C's activity timeout fires.
+    //
+    // Tracking and override now run for ALL streams that pass through
+    // CCodecStream — both cross-mode AMBE+ output (where slow-data is
+    // synthesised) and AMBE+ pass-through paths (native D-Star, DCS
+    // source, XLX-interlinked AMBE+ traffic such as BM-to-XLX DMR
+    // bridges that don't emit the marker themselves). For non-D-Star
+    // egress the DvData mutation is harmless because those encoders
+    // don't read DvData. See ccodecstream.cpp:512-578 for the full
+    // rationale.
+    //
+    // We don't know which voice frame is the last one until the EoT
+    // arrives. So we track a non-owning pointer to the most recently
+    // pushed voice frame while it is still sitting in m_JitterBuffer
+    // (it sits there for at least JITTER_BUFFER_DELAY_MS = 160ms before
+    // first release). When an EoT arrives in Task() Phase 1, if the
+    // pointer is non-NULL we overwrite that parked packet's slow-data
+    // in-place with the pre-EoT marker before releasing it. The pointer
+    // is cleared when the packet is popped from m_JitterBuffer (Phase 2)
+    // or when the EoT override has already consumed it.
+    //
+    // Access is serialised by m_Mutex (CCodecStream::Lock()): all three
+    // touch points (Phase 1 push-to-jitter, Phase 1 EoT override,
+    // Phase 2 pop-from-jitter) hold the lock for the entire operation.
+    // The pointer is strictly a tracking aid — it never owns the packet
+    // and is always cleared before the packet is destroyed.
+    CDvFramePacket *m_pLastVoiceInJitter;
+
+    // Build the 20-char text + 9-element header-sync from the packet
+    // stream's cached header and g_Reflector state, push them into
+    // m_SlowData via SetText() and SetHeaderSync(). Safe to call
+    // repeatedly — re-seeds both buffers each time.
+    void InitSlowData(void);
 };
 
 

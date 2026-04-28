@@ -80,7 +80,7 @@ public:
     
     // stream opening & closing
     CPacketStream *OpenStream(CDvHeaderPacket *, CClient *);
-    void CloseStream(CPacketStream *);
+    bool CloseStream(CPacketStream *);
 
     // late entry support
     bool TryLateEntry(CDvHeaderPacket *, CClient *);

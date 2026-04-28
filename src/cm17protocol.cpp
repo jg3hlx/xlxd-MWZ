@@ -917,8 +917,10 @@ bool CM17Protocol::IsValidDvHeaderPacket(const CBuffer &Buffer, CDvHeaderPacket 
                 if ( srcOk && dstValid )
                 {
                     // build header
-                    CCallsign rpt1 = m_ReflectorCallsign;
-                    rpt1.SetModule(' ');
+                    // RPT1 uses caller's callsign + 'B' — D-Star hotspot convention.
+                    // See cnxdnprotocol.cpp for the rationale.
+                    CCallsign rpt1 = csSource;
+                    rpt1.SetModule('B');
                     CCallsign rpt2 = m_ReflectorCallsign;
                     rpt2.SetModule(' ');
 

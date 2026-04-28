@@ -24,10 +24,57 @@
 
 #include "main.h"
 #include <string.h>
+#include <stdio.h>
 #include <vector>
+#include <chrono>
+#include <future>
 #include "ccodecstream.h"
 #include "cdvframepacket.h"
+#include "cpacketstream.h"
 #include "creflector.h"
+
+////////////////////////////////////////////////////////////////////////////////////////
+// startup timing
+
+// Maximum wall-clock wait for the codec thread to set m_bConnected after
+// construction. 500ms is generous — the codec thread's first action is to
+// set the flag, so in practice this completes in microseconds.
+#define CODEC_STREAM_START_TIMEOUT_MS   500
+
+// Maximum wait for the codec thread to exit on the startup-failure path.
+// If it doesn't join in this window, we leak the object rather than hang.
+#define CODEC_STREAM_JOIN_TIMEOUT_MS    1000
+
+// Join a codec thread and report whether it exited within a target
+// timeout. Returns true if the join completed inside `timeoutMs`, false
+// if it took longer.
+//
+// IMPORTANT: this function ALWAYS waits for the thread to finish — it is
+// not a "try-join-with-give-up" primitive. The `std::future` returned by
+// `std::async(launch::async, ...)` has a blocking destructor (C++ spec)
+// that waits for the shared state to be ready, which means when this
+// function returns, the thread has definitively exited regardless of
+// the return value. The caller can therefore safely delete the
+// std::thread object whether we return true or false.
+//
+// We deliberately do NOT use a detach-based "true timeout" pattern here
+// because the codec thread holds `this` — if we detached and let the
+// caller destroy the CCodecStream, the still-running thread would
+// perform use-after-free. Blocking-until-thread-exits is memory-safe;
+// the timeout is a pure indicator for logging.
+//
+// In practice the codec thread's loop is bounded by its 5ms socket
+// receive, so this returns quickly once `m_bStopThread` is set. A
+// long wait here indicates a system-level problem.
+static bool BoundedJoin(std::thread *t, int timeoutMs)
+{
+    if ( t == NULL ) return true;
+    if ( !t->joinable() ) return true;
+
+    auto future = std::async(std::launch::async, [t]() { t->join(); });
+    return future.wait_for(std::chrono::milliseconds(timeoutMs)) ==
+           std::future_status::ready;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // define
@@ -58,6 +105,9 @@ CCodecStream::CCodecStream(CPacketStream *PacketStream, uint16 uiId, uint8 uiCod
     m_PacketStream = PacketStream;
     m_bJitterBufferStarted = false;
     m_iInFlightPackets = 0;
+    m_bSlowDataInit = false;
+    m_uiSlowDataCycle = 0;
+    m_pLastVoiceInJitter = NULL;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -65,14 +115,18 @@ CCodecStream::CCodecStream(CPacketStream *PacketStream, uint16 uiId, uint8 uiCod
 
 CCodecStream::~CCodecStream()
 {
-    // stop thread first so it doesn't use the socket or queues
+    // Stop the thread first so it doesn't use the socket or queues.
+    // BoundedJoin always waits for the thread to exit; the return value
+    // tells us only whether it exited within the expected window.
     m_bStopThread = true;
-    if ( m_pThread != NULL )
+    if ( !BoundedJoin(m_pThread, CODEC_STREAM_JOIN_TIMEOUT_MS) )
     {
-        m_pThread->join();
-        delete m_pThread;
-        m_pThread = NULL;
+        std::cout << "Warning: codec thread took longer than "
+                  << CODEC_STREAM_JOIN_TIMEOUT_MS
+                  << "ms to exit at destructor" << std::endl;
     }
+    delete m_pThread;
+    m_pThread = NULL;
 
     // close socket only after thread is gone
     m_Socket.Close();
@@ -93,7 +147,11 @@ CCodecStream::~CCodecStream()
         pop();
         mainQueueLost++;
     }
-    // empty jitter buffer - these are transcoded packets waiting to be released
+    // empty jitter buffer - these are transcoded packets waiting to be released.
+    // Clear the pre-EoT tracking pointer first so it can't dangle past the
+    // delete(s) below (no consumer reads it after this point, but belt-and-
+    // braces in case a future change adds one).
+    m_pLastVoiceInJitter = NULL;
     int jitterQueueLost = 0;
     while ( !m_JitterBuffer.empty() )
     {
@@ -142,19 +200,31 @@ bool CCodecStream::Init(uint16 uiPort)
         // init timers
         m_TimeoutTimer.Now();
 
-        // start thread and wait for it to be ready before accepting packets
+        // Start thread and wait for it to be ready before accepting packets.
+        // Use a wall-clock timeout rather than a yield counter so a heavily
+        // loaded or virtualised host that doesn't schedule the new thread
+        // inside 1000 yields doesn't falsely flag startup as failed.
         m_pThread = new std::thread(CCodecStream::Thread, this);
-        int waitCount = 0;
-        while ( !m_bConnected && waitCount < 1000 )
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(CODEC_STREAM_START_TIMEOUT_MS);
+        while ( !m_bConnected && std::chrono::steady_clock::now() < deadline )
         {
-            std::this_thread::yield();
-            waitCount++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         if ( !m_bConnected )
         {
-            std::cout << "Error: codec thread failed to start on port UDP" << uiPort << std::endl;
+            std::cout << "Error: codec thread failed to start on port UDP" << uiPort
+                      << " within " << CODEC_STREAM_START_TIMEOUT_MS << "ms" << std::endl;
             m_bStopThread = true;
-            m_pThread->join();
+            // Bound the join's expected duration. BoundedJoin always waits
+            // for the thread to exit; the return value just tells us if it
+            // was prompt. We can safely delete either way.
+            if ( !BoundedJoin(m_pThread, CODEC_STREAM_JOIN_TIMEOUT_MS) )
+            {
+                std::cout << "Warning: codec thread on port UDP" << uiPort
+                          << " took longer than " << CODEC_STREAM_JOIN_TIMEOUT_MS
+                          << "ms to exit during startup-failure cleanup" << std::endl;
+            }
             delete m_pThread;
             m_pThread = NULL;
             m_Socket.Close();
@@ -176,15 +246,17 @@ void CCodecStream::Close(void)
     // close socket
     m_bConnected = false;
     m_Socket.Close();
-    
-    // kill threads
+
+    // kill threads; BoundedJoin always waits for the thread to exit
     m_bStopThread = true;
-    if ( m_pThread != NULL )
+    if ( !BoundedJoin(m_pThread, CODEC_STREAM_JOIN_TIMEOUT_MS) )
     {
-        m_pThread->join();
-        delete m_pThread;
-        m_pThread = NULL;
+        std::cout << "Warning: codec thread took longer than "
+                  << CODEC_STREAM_JOIN_TIMEOUT_MS
+                  << "ms to exit at Close()" << std::endl;
     }
+    delete m_pThread;
+    m_pThread = NULL;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -211,6 +283,99 @@ bool CCodecStream::IsEmpty(void) const
     // CPacketStream::IsEmpty() checks its own queue before calling us,
     // so we only need to report on the transcoder pipeline queues
     return result;
+}
+
+// Count packets currently anywhere in the transcoder pipeline. Mirrors
+// the field set IsEmpty() inspects, summed rather than AND-reduced.
+// Used by CReflector::CloseStream's drain loop for stall detection:
+// depth is expected to monotonically decrease once the source stops
+// pushing new frames; a flat depth over MAX_STALL_WAIT_MS indicates
+// AMBEd is wedged and the drain should bail rather than waste the full
+// wait-cap starving single-threaded protocols' keepalive processing.
+size_t CCodecStream::GetDepth(void) const
+{
+    CCodecStream *pThis = const_cast<CCodecStream *>(this);
+
+    pThis->Lock();
+    size_t depth = size() + m_LocalQueue.size() + m_JitterBuffer.size();
+    pThis->Unlock();
+
+    // m_iInFlightPackets covers the jitter-pop → stream-push gap (popped
+    // from jitter under codec lock, not yet pushed into m_PacketStream).
+    // Atomic read, no lock needed.
+    int inFlight = m_iInFlightPackets.load();
+    if ( inFlight > 0 )
+    {
+        depth += (size_t)inFlight;
+    }
+    return depth;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// slow-data initialisation
+//
+// Only relevant when we're transcoding *to* AMBE+ (i.e. cross-mode → D-Star).
+// Reads the stream's opening header for the source-mode tag (4-byte SUFFIX
+// field set by the ingress protocol handler — "NXDN", "DMR ", "YSF ",
+// "P25 ", "M17 ", or a user-set 4-char radio ID for native D-Star) and
+// composes a 20-character text message of the form:
+//
+//     "<MODE> via <REFLECTOR> <MODULE>"
+//
+// Example for an NXDN caller on XLX672 module B:
+//
+//     "NXDN via XLX672 B   "
+//
+// 20 chars maximum — D-Star slow-data cannot carry more. If the reflector
+// callsign is longer than 6 chars the module may get pushed out. The text
+// is forwarded into m_SlowData, whose GetSlowData() then emits the
+// XOR-scrambled 3-byte segments on every non-sync frame of the 21-frame
+// cycle. A strict Icom RP2C decoder uses this text + repeating sync
+// marker to achieve voice-frame lock; without it the AMBE+ stream is
+// correct but gets silently muted on reception.
+
+void CCodecStream::InitSlowData(void)
+{
+    // Defensive fallback. Should never trigger in practice — CCodecStream
+    // is always constructed with a valid CPacketStream — but guards against
+    // a future refactor that forgets to wire it. When the stream is absent
+    // we can't arm the header-sync buffer (no source for the 41-byte header)
+    // so only the text buffer is populated and GetSlowData() will emit
+    // filler on any header-mode cycles.
+    if ( m_PacketStream == NULL )
+    {
+        char blank[DSTAR_SLOW_DATA_TEXT_LEN + 1];
+        ::memset(blank, ' ', DSTAR_SLOW_DATA_TEXT_LEN);
+        blank[DSTAR_SLOW_DATA_TEXT_LEN] = '\0';
+        m_SlowData.SetText(blank);
+        // Cycle counter stays at 0 — cycle 0 = text per the alternation policy.
+        return;
+    }
+
+    // Compose the 20-char text via the shared helper. The same helper is
+    // used by CDcsProtocol::EncodeDvPacket to populate the DCS voice-frame
+    // text field at offset 64-83, so slow-data and text-field always carry
+    // identical bytes on the wire.
+    //
+    // No locks required — m_DvHeader is immutable for the stream's lifetime
+    // once Open() returns.
+    const CDvHeaderPacket &hdr = m_PacketStream->GetDvHeader();
+    char text[DSTAR_SLOW_DATA_TEXT_LEN + 1];
+    CDStarSlowData::ComposeText(hdr, text);
+    text[DSTAR_SLOW_DATA_TEXT_LEN] = '\0';   // SetText strlens its input
+    m_SlowData.SetText(text);
+
+    // Arm the header-sync buffer from the same cached header. Native D-Star
+    // radios emit this on alternating cycles to give strict receivers a
+    // copy of the RF header — without it, g2_link → Icom RP2C silently
+    // mutes our cross-mode audio even though AMBE+ decodes correctly on
+    // software receivers. See cdstarslowdata.h for format details.
+    m_SlowData.SetHeaderSync(hdr);
+
+    // Start at cycle 0 (text) — matches the observed native-radio pattern
+    // where the first post-header cycle is always text-mode content.
+    m_SlowData.BeginTextCycle();
+    m_uiSlowDataCycle = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -273,10 +438,142 @@ void CCodecStream::Task(void)
                 Packet->SetAmbe(m_uiCodecOut2, Ambe2);
                 Packet->SetAmbe(m_uiCodecOut3, Ambe3);
 
-                if ( (m_uiCodecOut1 == CODEC_AMBEPLUS || m_uiCodecOut2 == CODEC_AMBEPLUS) &&
-                     (Packet->GetPacketId() % 21) == 0 )
+                // D-Star slow-data synthesis for cross-mode → AMBE+ egress.
+                //
+                // A strict D-Star decoder (Icom RP2C / G3 hardware) will
+                // silently mute the AMBE+ audio if it can't lock onto the
+                // 21-frame slow-data cycle. Software decoders (ircDDBGateway,
+                // MMDVM) tolerate missing slow-data; Icom hardware does not.
+                //
+                // Wire format produced here (see cdstarslowdata.h for detail):
+                //   frame 0  of cycle : sync marker 0x55 0x2D 0x16 (unscrambled)
+                //   cycle 0 — TEXT cycle (emitted exactly once per transmission):
+                //     frames 1..8   : 4 × 6-byte scrambled text segments
+                //     frames 9..20  : null-fill 0x16 0x29 0xF5
+                //   cycles 1+ — HEADER-SYNC cycle (emitted on every subsequent cycle):
+                //     frames 1..18 : 9 × 6-byte scrambled header-sync elements
+                //     frames 19..20: null-fill
+                //
+                // Policy matches native D-Star radio behaviour confirmed
+                // by pcap analysis of a Pi-Star source: the radio emits
+                // its text message on cycle 0 only, then streams
+                // header-sync continuously on every cycle thereafter.
+                // Strict Icom RP2C hardware (via g2_link) appears to
+                // validate header-sync continuity and mutes audio if it
+                // sees cycles without header-sync. An earlier design
+                // that alternated text/header cycles produced valid
+                // bytes but didn't match native behaviour, and may
+                // still trigger rejection on some receivers.
+                if ( m_uiCodecOut1 == CODEC_AMBEPLUS || m_uiCodecOut2 == CODEC_AMBEPLUS )
                 {
-                    Packet->SetDvData(DStarSync);
+                    // Lazy-init on the first AMBE+ output frame of the
+                    // stream — the header is guaranteed to be cached in
+                    // the packet stream by this point.
+                    if ( !m_bSlowDataInit )
+                    {
+                        InitSlowData();
+                        m_bSlowDataInit = true;
+                    }
+
+                    uint8 dvdata[3];
+                    if ( (Packet->GetPacketId() % 21) == 0 )
+                    {
+                        // Sync frame — emit the unscrambled 21-frame sync
+                        // marker and select slow-data mode for the 20
+                        // non-sync frames that follow.
+                        //
+                        // Policy: cycle 0 carries the text message, every
+                        // subsequent cycle carries header-sync. This
+                        // matches the native D-Star radio pattern
+                        // confirmed from a multi-cycle pcap of a Pi-Star
+                        // source — the radio emitted text once and then
+                        // header-sync on every cycle until the end of
+                        // transmission, never returning to text.
+                        ::memcpy(dvdata, DStarSync, sizeof(dvdata));
+                        if ( m_uiSlowDataCycle == 0U )
+                        {
+                            // Cycle 0: text message, emitted once.
+                            m_SlowData.BeginTextCycle();
+                        }
+                        else
+                        {
+                            // Cycles 1+: header-sync, emitted continuously.
+                            m_SlowData.BeginHeaderCycle();
+                        }
+                        m_uiSlowDataCycle++;
+                    }
+                    else
+                    {
+                        m_SlowData.GetSlowData(dvdata);
+                    }
+                    Packet->SetDvData(dvdata);
+                }
+
+                // Pre-EoT slow-data marker injection — applies to ALL streams
+                // that flow through CCodecStream, NOT just cross-mode AMBE+
+                // output. Outside the AMBE+-output gate above because:
+                //
+                //   - Cross-mode → D-Star (AMBE+ in output set): we synthesise
+                //     the slow-data, so we own the marker emission. Today.
+                //
+                //   - AMBE+-input streams (native D-Star, DCS source, DPlus
+                //     source, AND XLX-interlinked AMBE+ traffic such as
+                //     BrandMeister DMR via a BM-to-XLX bridge): AMBE+ is the
+                //     INPUT codec; transcoder outputs are AMBE+2/Codec2/IMBE,
+                //     so the gate above is FALSE and slow-data synthesis is
+                //     skipped. The packet's DvData carries whatever the source
+                //     emitted.
+                //
+                //     For real D-Star radio sources the source naturally emits
+                //     0x55 0x55 0x55 wire on frame N-1 per JARL convention, so
+                //     this override is a no-op rewrite of identical bytes —
+                //     verified on wire in the DCS-source → DCS-egress capture.
+                //
+                //     For XLX-interlinked AMBE+ sources (BM-to-XLX DMR
+                //     bridges, etc.) the bridge typically does not emit the
+                //     marker — it's a transcoder, not a real radio. Without
+                //     this fix, the pre-EoT marker would be missing on the
+                //     wire when DMR-via-XLX-interlink reaches a strict D-Star
+                //     decoder (Icom RP2C via g2_link), causing the same
+                //     stream-slot-stuck-until-timeout failure mode that the
+                //     original cross-mode pre-EoT fix addressed.
+                //
+                // The slow-data synthesis (text/header-sync) above remains
+                // gated to AMBE+ output only — we only synthesise slow-data
+                // when the source didn't have any. This block is the marker
+                // override only, applied universally.
+                //
+                // Mechanics: track a non-owning pointer to the most recently
+                // pushed voice frame while it sits in m_JitterBuffer (~160ms
+                // window). On EoT arrival, mutate that parked packet's DvData
+                // in-place. The pointer is cleared on jitter-pop (Phase 2)
+                // and on EoT override here. For non-D-Star egress (DMR, M17,
+                // P25), the egress encoder doesn't read m_uiDvData at all,
+                // so the override is harmless on those paths.
+                if ( Packet->IsLastPacket() )
+                {
+                    if ( m_pLastVoiceInJitter != NULL )
+                    {
+                        // Wire bytes 55 55 55. SetDvData memcpy's these
+                        // into the packet's DvData slot; they go to the
+                        // wire as-is (scrambler is applied upstream when
+                        // synthesised; for AMBE+ pass-through the source
+                        // emits these literal wire bytes per JARL spec).
+                        static const uint8 preEoTSlowData[3] =
+                            { 0x55, 0x55, 0x55 };
+                        m_pLastVoiceInJitter->SetDvData(
+                            const_cast<uint8 *>(preEoTSlowData));
+                        m_pLastVoiceInJitter = NULL;
+                    }
+                }
+                else
+                {
+                    // Regular voice frame. Track it as the most recent
+                    // override candidate; superseded by each subsequent
+                    // voice frame, cleared on jitter-pop (Phase 2) or on
+                    // EoT override (above). Packet is already typed as
+                    // CDvFramePacket* above, no cast needed.
+                    m_pLastVoiceInJitter = Packet;
                 }
 
                 m_JitterBuffer.push(Packet);
@@ -305,7 +602,17 @@ void CCodecStream::Task(void)
         int released = 0;
         while ( !m_JitterBuffer.empty() && now >= m_NextReleaseTime && released < 3 )
         {
-            toRelease.push_back(m_JitterBuffer.front());
+            CPacket *p = m_JitterBuffer.front();
+            // If this is the packet our pre-EoT override tracking points
+            // to, clear the tracking pointer before releasing — once the
+            // packet leaves the jitter buffer we can no longer safely
+            // mutate its slow-data (it may be handed off, freed, or on
+            // the wire by the time a later EoT arrives).
+            if ( p == m_pLastVoiceInJitter )
+            {
+                m_pLastVoiceInJitter = NULL;
+            }
+            toRelease.push_back(p);
             m_JitterBuffer.pop();
             m_uiReturnedPackets++;
             m_NextReleaseTime += std::chrono::milliseconds(JITTER_BUFFER_FRAME_MS);
