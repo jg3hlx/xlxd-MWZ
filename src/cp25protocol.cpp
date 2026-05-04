@@ -270,14 +270,23 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
     // risk deadlock with the OnTerminatorPacketIn path which holds Peers
     // while calling Lookup/Release.
     //
-    // Allocate / look up the reflector-side stream-id. P25 uses LDU1
-    // Voice1 (0x62) as the implicit start-of-transmission marker (the
-    // existing pending-header logic below also keys on this), so that's
-    // where we allocate a fresh sid. All other LDU records look up the
-    // active mapping. See the helper comments in cp25protocol.h for the
-    // full motivation.
+    // Allocate / look up the reflector-side stream-id. P25 is unlike
+    // NXDN/YSF here — it has no explicit start-of-transmission frame
+    // type. LDU1 (containing Voice1..Voice9) and LDU2 alternate every
+    // ~180 ms throughout the transmission, so LDU1_VOICE1 fires every
+    // 360 ms even mid-transmission. Allocating a fresh sid on every
+    // LDU1_VOICE1 (the previous behaviour) cut a single P25
+    // transmission into many 18-frame substreams — each new sid opened
+    // a new xlxd stream, expired without a TDU, tripped the per-source
+    // loop detector after 3 strikes, and ultimately blocked TX for
+    // 300 s. So allocate ONLY when there is no active mapping for this
+    // source (true start-of-transmission); otherwise reuse the
+    // existing mapping (mid-transmission LDU1 cycle). The mapping is
+    // released by OnTerminatorPacketIn when the TDU arrives, so the
+    // next LDU1_VOICE1 after a TDU is correctly recognised as a new
+    // transmission.
     uint32 uiStreamId;
-    if ( cmd == P25_REC_LDU1_VOICE1 )
+    if ( cmd == P25_REC_LDU1_VOICE1 && !HasActiveStreamIdForSource(Ip) )
     {
         uiStreamId = AllocateNewStreamIdForSource(Ip);
     }
@@ -1300,6 +1309,19 @@ uint32 CP25Protocol::LookupStreamIdForSource(const CIp &ip) const
         return it->second;
     }
     return IpToStreamId(ip);
+}
+
+// Test whether this source has an active stream-id mapping (i.e. a
+// transmission is currently in progress and its sid hasn't been
+// released by a TDU yet). Used by the LDU1_VOICE1 dispatch above to
+// distinguish a true start-of-transmission (no active mapping → fresh
+// allocate) from a mid-transmission LDU1 cycle (active mapping →
+// reuse existing sid). See the dispatch comment in OnLduPacketIn for
+// the full rationale.
+bool CP25Protocol::HasActiveStreamIdForSource(const CIp &ip) const
+{
+    std::lock_guard<std::mutex> lock(m_SourceStatesMutex);
+    return m_SourceStates.find(P25SourceKey(ip)) != m_SourceStates.end();
 }
 
 // Drop the IP→sid mapping after the TDU is processed. The next LDU1

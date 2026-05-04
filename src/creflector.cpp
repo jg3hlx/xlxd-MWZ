@@ -348,100 +348,48 @@ bool CReflector::CloseStream(CPacketStream *stream)
     // the drain loop would hold stream lock then acquire codec lock (via
     // CCodecStream::IsEmpty), while CCodecStream::Task() holds codec lock
     // then acquires stream lock (for jitter buffer release).
-    // The only writer to the stream queue at this point is CCodecStream::Task()
-    // returning transcoded packets — no router traffic since we're at end of
-    // transmission. A momentary read-race on the queue is benign: at worst we
-    // poll one extra 10ms cycle.
     //
-    // Two bounds govern when we stop waiting:
+    // After the ambed-decoupling rework (jitter buffer releases packets
+    // on a fixed 20 ms cadence regardless of ambed state), the drain
+    // proceeds at one packet per JITTER_BUFFER_FRAME_MS once the source
+    // stops pushing — so worst-case wall-clock is roughly the jitter
+    // buffer occupancy × 20 ms. Steady-state occupancy is ~8 frames
+    // (~160 ms); a burst-at-close pathology can leave up to ~50 frames
+    // (~1000 ms). The 2000 ms cap is the safety bound for the
+    // pathological case; it's not normally reached.
     //
-    //   MAX_DRAIN_WAIT_MS (2000ms) — absolute cap. Needed because a
-    //     burst of voice frames queued in the kernel UDP buffer during
-    //     an OpenStream Phase 2 handshake can leave up to ~50 frames in
-    //     the jitter buffer at close time, and the jitter buffer
-    //     releases one per JITTER_BUFFER_FRAME_MS (20ms) — draining
-    //     50 frames takes ~1000ms. A 500ms cap here was cutting ~25
-    //     tail frames in that scenario.
-    //
-    //   MAX_STALL_WAIT_MS (300ms) — progress timeout. If pipeline
-    //     depth (codec main queue + local queue + jitter buffer + in-
-    //     flight + stream base queue + pre-codec buffer) has not
-    //     DECREASED for this window, AMBEd is wedged and the drain
-    //     will never complete. Bail rather than block the caller
-    //     thread for the full 2000ms — a 2000ms block on a single-
-    //     threaded protocol (XLX interlink, DMR+, DMRMMDVM, IMRS, G3)
-    //     starves keepalive processing and trips peer time-outs. That
-    //     was the original regression reason the cap was once lowered
-    //     to 500ms.
-    //
-    // Worst-case wall-clock when AMBEd is wedged: 1 baseline poll +
-    // 30 stall polls = ~310ms. Safely under keepalive period on all
-    // single-threaded protocols, better than the old 500ms cap for
-    // that pathological case, and gives the healthy-but-bursty case
-    // the full 2000ms it needs to preserve tail audio.
-    //
-    // The stall check uses `currentDepth >= lastDepth` (treats equal-
-    // or-greater as non-progress). A tempting tweak is to tolerate
-    // 1-packet noise from cross-lock visibility at the codec→stream
-    // handoff (`currentDepth < lastDepth - 1`), but that breaks the
-    // common-case burst drain: the jitter buffer releases exactly one
-    // packet per JITTER_BUFFER_FRAME_MS, so a `-2` threshold would
-    // prevent `stalledMs` from ever resetting during legitimate drain
-    // and falsely trip stall detection. The `>=` comparison handles
-    // transient 1-packet cross-boundary noise correctly: the next
-    // 10ms poll catches up, stall accumulates at most ~10-20ms before
-    // resetting, never approaching MAX_STALL_WAIT_MS.
+    // The stall-detection logic that used to live here was specifically
+    // for the pre-rework architecture where ambed could wedge the
+    // pipeline indefinitely (packets piled in m_LocalQueue, never
+    // released). With ambed now structurally optional in the audio
+    // path, "stall" is no longer a possible state — the jitter timer
+    // always advances. So the drain reduces to: "wait until empty, or
+    // until the absolute cap as a hard safety bound."
     static const int MAX_DRAIN_WAIT_MS = 2000;
-    static const int MAX_STALL_WAIT_MS = 300;
     static const int DRAIN_POLL_MS = 10;
 
-    int    waitedMs = 0;
-    int    stalledMs = 0;
-    size_t lastDepth = 0;
-    bool   hasBaseline = false;
-    bool   bEmpty = false;
-    bool   bStalled = false;
+    int  waitedMs = 0;
+    bool bEmpty = false;
 
     while ( waitedMs < MAX_DRAIN_WAIT_MS )
     {
         bEmpty = stream->IsEmpty();
         if ( bEmpty ) break;
 
-        size_t currentDepth = stream->GetPipelineDepth();
-        if ( !hasBaseline )
-        {
-            lastDepth = currentDepth;
-            hasBaseline = true;
-        }
-        else if ( currentDepth >= lastDepth )
-        {
-            stalledMs += DRAIN_POLL_MS;
-            if ( stalledMs >= MAX_STALL_WAIT_MS )
-            {
-                bStalled = true;
-                break;
-            }
-        }
-        else
-        {
-            stalledMs = 0;
-            lastDepth = currentDepth;
-        }
-
         CTimePoint::TaskSleepFor(DRAIN_POLL_MS);
         waitedMs += DRAIN_POLL_MS;
     }
 
-    if ( bStalled )
+    if ( !bEmpty )
     {
-        std::cout << "Warning: CloseStream drain stalled at " << lastDepth
-                  << " packet(s) after " << waitedMs << "ms — AMBEd unresponsive, aborting drain"
-                  << std::endl;
-    }
-    else if ( !bEmpty )
-    {
+        // Reached the absolute cap. The pathological case where this
+        // can fire today is a Phase-2 OpenStream burst that leaves >100
+        // frames queued, which exceeds the cap's release budget. Log
+        // for diagnosis; the destructor will drop the remaining
+        // packets and the per-CCodecStream warning line will quantify
+        // the loss.
         std::cout << "Warning: CloseStream drain hit " << MAX_DRAIN_WAIT_MS
-                  << "ms cap, some transcoded packets may be lost" << std::endl;
+                  << "ms cap, some packets may be lost" << std::endl;
     }
 
     // Snapshot what we need under the stream + clients locks, then

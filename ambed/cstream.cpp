@@ -668,6 +668,17 @@ void CStream::TaskCodec2Input(void)
             CVoicePacket *voicePacket2 = new CVoicePacket(pcmBytes2, 320);
             voicePacket2->SetChannel(m_EncoderChannel2->GetChannelOut());
 
+            // PID-preservation: push the input packet's PID into both
+            // encoder channels' FIFOs so the matching pops in the USB
+            // interface (when the AMBE responses arrive from hardware)
+            // can re-attach the correct PID to the output packets. The
+            // response builder below uses packet1->GetPid() for the
+            // outbound response, so channel 1's pid is the one that
+            // matters; channel 2's is pushed for symmetry / future-
+            // proofing in case any future code path reads packet2's pid.
+            m_EncoderChannel1->PushPid(uiPid);
+            m_EncoderChannel2->PushPid(uiPid);
+
             // Push to encoder channel 1 (AMBE+)
             queue1 = m_EncoderChannel1->GetVoiceQueue();
             queue1->push(voicePacket1);
@@ -820,6 +831,14 @@ void CStream::TaskImbeInput(void)
 
             CVoicePacket *voicePacket2 = new CVoicePacket(pcmBytes2, 320);
             voicePacket2->SetChannel(m_EncoderChannel2->GetChannelOut());
+
+            // PID-preservation: push the input packet's PID into both
+            // encoder channels' FIFOs so the matching pops in the USB
+            // interface (when the AMBE responses arrive from hardware)
+            // can re-attach the correct PID. Same rationale as
+            // TaskCodec2Input above.
+            m_EncoderChannel1->PushPid(uiPid);
+            m_EncoderChannel2->PushPid(uiPid);
 
             // Push to encoder channel 1 (AMBE+)
             queue1 = m_EncoderChannel1->GetVoiceQueue();

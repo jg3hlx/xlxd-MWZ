@@ -28,6 +28,7 @@
 #include <atomic>
 #include <queue>
 #include <chrono>
+#include <unordered_map>
 #include "csemaphore.h"
 #include "cudpsocket.h"
 #include "cpacketqueue.h"
@@ -100,6 +101,8 @@ public:
     uint32 GetTotalPackets(void) const      { return m_uiTotalPackets; }
     uint32 GetTimeoutPackets(void) const    { return m_uiTimeoutPackets; }
     uint32 GetReturnedPackets(void) const   { return m_uiReturnedPackets; }
+    uint32 GetResponseLookupMisses(void) const { return m_uiResponseLookupMisses; }
+    uint32 GetUnfilledReleases(void) const     { return m_uiUnfilledReleases; }
     bool   IsEmpty(void) const;
     size_t GetDepth(void) const;
 
@@ -133,7 +136,6 @@ protected:
     
     // associated packet stream
     CPacketStream   *m_PacketStream;
-    CPacketQueue    m_LocalQueue;
 
     // thread
     std::atomic<bool> m_bStopThread;
@@ -150,12 +152,64 @@ protected:
     uint32          m_uiTimeoutPackets;
     uint32          m_uiReturnedPackets;
 
-    // Jitter buffer - smooths out variable ambed latency
-    // Packets are queued here with target release times, then released
-    // at regular 20ms intervals to ensure smooth playback
+    // Health metrics (reported in the ambed-stats log line at stream close).
+    // m_uiResponseLookupMisses counts ambed responses that arrived for a
+    // packet already released from the jitter buffer (network loss + slow
+    // ambed combined, or ambed RTT > JITTER_BUFFER_DELAY_MS). High values
+    // indicate ambed is unhealthy or the LAN is dropping return packets.
+    // m_uiUnfilledReleases counts jitter pops where ambed never responded
+    // (transcoded slots stayed zero). High values indicate outbound xlxd
+    // → ambed loss or ambed unable to keep up; transcoded listeners hear
+    // silence on those frames, but D-Star pass-through audio is intact.
+    //
+    // Atomic: written from Task() (the codec thread) and read from the
+    // ctranscoder.cpp close-stats path (which runs on whichever protocol
+    // thread invoked CloseStream). Read is unlocked; using std::atomic
+    // ensures a torn read can't happen on the rare worker-architecture
+    // where uint32 isn't naturally atomic.
+    std::atomic<uint32> m_uiResponseLookupMisses;
+    std::atomic<uint32> m_uiUnfilledReleases;
+
+    // Jitter buffer - smooths out variable ambed latency.
+    //
+    // Packets enter immediately on Push (NOT after ambed responds — see
+    // the architectural note at the top of CCodecStream::Task). Each
+    // packet starts with only its source-codec slot filled (e.g. AMBE+
+    // for a D-Star source). ambed responses fill in the other codec
+    // slots in-place via lookup through m_PendingTranscode while the
+    // packet is still in the jitter buffer. When the release timer
+    // fires (every JITTER_BUFFER_FRAME_MS = 20 ms), the front packet
+    // is released to the packet stream — whatever transcoded slots
+    // happened to be filled by then are filled, the rest are zero.
+    //
+    // Net effect: ambed is enrichment, not a gate. D-Star pass-through
+    // audio reaches D-Star listeners on the regular cadence regardless
+    // of UDP loss to/from ambed or ambed being totally offline. Other-
+    // mode listeners hear silence on frames whose transcoded slots
+    // didn't get filled in time.
     std::queue<CPacket *>  m_JitterBuffer;
     std::chrono::steady_clock::time_point m_NextReleaseTime;
     bool            m_bJitterBufferStarted;
+
+    // Lookup index from the uint8 PID echoed in ambed responses to the
+    // CDvFramePacket currently sitting in m_JitterBuffer. Non-owning —
+    // entries always alias a packet whose lifetime is bounded by the
+    // jitter buffer (entered at Push, removed at jitter-pop or close-
+    // purge). Both reads and writes happen under CCodecStream::Lock(),
+    // same as m_JitterBuffer itself.
+    //
+    // PID is the m_uiPid value at send-to-ambed time (CCodecStream's
+    // monotonic uint8 counter, wraps at 256). Map size is bounded by
+    // the in-flight jitter-buffer occupancy (~JITTER_BUFFER_DELAY_MS /
+    // JITTER_BUFFER_FRAME_MS = 8 frames at steady state, max ~50 in a
+    // pathological stall) which is far below the 256-PID space — so
+    // wraparound never causes key collision in the live working set.
+    //
+    // Side benefit over the previous FIFO-pop design: out-of-order or
+    // partially-lost ambed responses are matched to the correct packet
+    // by PID. The previous m_LocalQueue.pop_front() approach silently
+    // mis-paired transcoded slots when any single response was dropped.
+    std::unordered_map<uint8, CDvFramePacket *> m_PendingTranscode;
 
     // In-flight counter: packets popped from jitter buffer but not yet
     // pushed to the packet stream. Prevents IsEmpty() from returning true

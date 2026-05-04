@@ -79,6 +79,31 @@ public:
     CPacketQueue *GetVoiceQueue(void)       { m_QueueVoice.Lock(); return &m_QueueVoice; }
     void ReleaseVoiceQueue(void)            { m_QueueVoice.Unlock(); }
 
+    // PID preservation through the DVStick pipeline.
+    //
+    // The hardware response parser (CUsb3xxx*Interface::IsValidChannelPacket)
+    // creates a fresh CAmbePacket from raw USB bytes and has no way to
+    // recover the PID that was on the corresponding input packet — the
+    // PID is lost the moment the input packet is consumed by the USB
+    // write path. Without preservation, every output packet has PID=0
+    // and xlxd's PID-keyed response routing breaks (every response after
+    // the first looks like a stale duplicate).
+    //
+    // Approach: each CVocodecChannel holds a FIFO of PIDs. The USB
+    // interface push pids when consuming an input packet (decoder side
+    // for AMBE-input mode, encoder side for Codec2/IMBE-input modes)
+    // and pops when producing an output packet. The DVStick processes
+    // packets in FIFO order per physical channel, so pop order matches
+    // push order — pid round-trips correctly via FIFO pairing rather
+    // than via byte-in-the-packet preservation that the hardware
+    // protocol doesn't support.
+    //
+    // PopPid returns 0 if the FIFO is empty (matches the
+    // pre-fix default-PID behaviour and guarantees PopPid never
+    // crashes on an unexpected hardware response).
+    void  PushPid(uint8 pid);
+    uint8 PopPid(void);
+
     // Codec2 queue (for software-encoded Codec2 data)
     void EnableCodec2(bool bEnable);
     bool HasCodec2Data(void);
@@ -113,6 +138,14 @@ protected:
     CPacketQueue        m_QueuePacketOut;
     // voice queue
     CPacketQueue        m_QueueVoice;
+
+    // PID preservation FIFO — see PushPid/PopPid comment above the
+    // public methods. Touched by the USB interface Task() thread (push
+    // on input consume, pop on output produce) and cleared by
+    // PurgeAllQueues from Open/Close paths on potentially other threads,
+    // so a dedicated mutex guards it.
+    std::queue<uint8>   m_PidFifo;
+    std::mutex          m_PidFifoMutex;
     
     // settings
     int                 m_iSpeechGain;

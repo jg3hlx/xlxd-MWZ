@@ -532,6 +532,47 @@ void CVocodecChannel::PurgeAllQueues(void)
             m_ImbePcmQueue.pop();
         }
     }
+
+    // Clear PID-preservation FIFO. Important: any pids left in the FIFO
+    // here would mis-pair with future input/output once the channel
+    // re-opens, because the hardware response queue and FIFO push/pop
+    // would be one or more entries out of step.
+    {
+        std::lock_guard<std::mutex> lock(m_PidFifoMutex);
+        while ( !m_PidFifo.empty() )
+        {
+            m_PidFifo.pop();
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
+// PID preservation FIFO
+
+void CVocodecChannel::PushPid(uint8 pid)
+{
+    std::lock_guard<std::mutex> lock(m_PidFifoMutex);
+    m_PidFifo.push(pid);
+}
+
+uint8 CVocodecChannel::PopPid(void)
+{
+    std::lock_guard<std::mutex> lock(m_PidFifoMutex);
+    if ( m_PidFifo.empty() )
+    {
+        // Hardware produced an output without a corresponding input
+        // having been queued — should not happen in normal operation,
+        // but on stream-open the device may emit a stale residual
+        // packet from a prior stream that was Purge'd. Returning 0
+        // makes that response equivalent to the pre-fix behaviour
+        // (xlxd's PID-keyed lookup will miss, ambed-stats will record
+        // a "late" event, and audio is unaffected because the packet
+        // it would have paired with is already gone).
+        return 0;
+    }
+    uint8 pid = m_PidFifo.front();
+    m_PidFifo.pop();
+    return pid;
 }
 
 

@@ -324,16 +324,29 @@ void CTranscoder::ReleaseStream(CCodecStream *stream)
                     EncodeClosestreamPacket(&Buffer, m_Streams[i]->GetStreamId());
                     m_Socket.Send(Buffer, m_Ip, TRANSCODER_PORT);
                     
-                    // display stats
+                    // display stats. Two health counters added with the
+                    // ambed-decoupling rework: lookup_misses = ambed
+                    // responses that arrived after the jitter timer had
+                    // already released the packet (LAN return-path loss
+                    // or ambed RTT > JITTER_BUFFER_DELAY_MS); unfilled =
+                    // jitter-pops where ambed never responded at all
+                    // (LAN forward-path loss or ambed offline). Both
+                    // are zero in a healthy deployment. Non-zero values
+                    // mean some other-mode listeners heard ~20 ms of
+                    // silence per affected frame; D-Star pass-through
+                    // audio is unaffected by either.
                     {
-                        char sz[256];
+                        char sz[320];
                         uint32 sent = m_Streams[i]->GetTotalPackets();
                         uint32 returned = m_Streams[i]->GetReturnedPackets();
-                        snprintf(sz, sizeof(sz), "ambed stats (ms) : %.1f/%.1f/%.1f — %d sent, %d returned",
+                        uint32 lookupMisses = m_Streams[i]->GetResponseLookupMisses();
+                        uint32 unfilled = m_Streams[i]->GetUnfilledReleases();
+                        snprintf(sz, sizeof(sz),
+                                "ambed stats (ms) : %.1f/%.1f/%.1f — %d sent, %d returned, %d late, %d unfilled",
                                 m_Streams[i]->GetPingMin() * 1000.0,
                                 m_Streams[i]->GetPingAve() * 1000.0,
                                 m_Streams[i]->GetPingMax() * 1000.0,
-                                sent, returned);
+                                sent, returned, lookupMisses, unfilled);
                         std::cout << sz << std::endl;
                     }
 

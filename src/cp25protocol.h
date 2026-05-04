@@ -141,6 +141,7 @@ protected:
     // cysfprotocol.h for the full discussion (same caveat applies).
     uint32 AllocateNewStreamIdForSource(const CIp &);
     uint32 LookupStreamIdForSource(const CIp &) const;
+    bool   HasActiveStreamIdForSource(const CIp &) const;
     void   ReleaseStreamIdForSource(const CIp &);
     uint32 IpToStreamId(const CIp &) const;
 
