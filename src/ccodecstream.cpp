@@ -729,19 +729,43 @@ void CCodecStream::Task(void)
         // creating a single huge cadence-stutter event. See the
         // constant's header comment for the trade-off rationale.
         //
-        // Threshold computation: ms first, then divide by frame-ms.
-        // Doing it the other way around (packets first, then ratio)
-        // truncates twice and drifts away from the nominal ratio for
-        // any target that isn't a multiple of 20 ms.
+        // Threshold computation: hybrid of multiplicative ratio and
+        // additive burst headroom — see JITTER_OVERRUN_RATIO_* and
+        // JITTER_OVERRUN_BURST_HEADROOM in the header for the full
+        // rationale. The larger of the two paths wins.
+        //
+        // Ratio path: ms first, then divide by frame-ms. Doing it the
+        // other way around (packets first, then ratio) truncates twice
+        // and drifts away from the nominal ratio for any target that
+        // isn't a multiple of 20 ms.
+        //
+        // Additive path: target_pkts is the integer-truncated target.
+        // We add headroom in packets directly. Truncation is one-sided
+        // (down) so the threshold is at most 1 packet looser than the
+        // continuous-math version — same direction as the ratio path
+        // and acceptable for the same reason.
+        //
+        // Crossover point where the two paths agree:
+        //   target_pkts * NUM/DEN == target_pkts + HEADROOM
+        //   => target_pkts == HEADROOM * DEN / (NUM - DEN)
+        //   => at NUM=2,DEN=1,HEADROOM=12: target_pkts = 12 (240 ms).
+        // Below crossover, additive dominates (low-target burst
+        // protection); above crossover, ratio dominates (large-target
+        // bound on absolute peak buffered audio).
         if ( m_bFirstReleaseDone )
         {
-            size_t overrunThresholdMs =
+            size_t targetPkts = m_CurrentJitterDelayMs / JITTER_BUFFER_FRAME_MS;
+            size_t overrunRatioMs =
                 ((size_t)m_CurrentJitterDelayMs * JITTER_OVERRUN_RATIO_NUM) /
                 JITTER_OVERRUN_RATIO_DEN;
-            size_t overrunThreshold = overrunThresholdMs / JITTER_BUFFER_FRAME_MS;
+            size_t ratioPkts = overrunRatioMs / JITTER_BUFFER_FRAME_MS;
+            size_t additivePkts = targetPkts + JITTER_OVERRUN_BURST_HEADROOM;
+            size_t overrunThreshold = std::max<size_t>(ratioPkts, additivePkts);
             // Belt-and-braces: if anyone ever lowers MIN_JITTER_DELAY_MS
-            // below FRAME_MS, the threshold floors to zero and the loop
-            // would drop everything. Guard against that future regression.
+            // below FRAME_MS, the ratio path floors to zero. The
+            // additive path's +HEADROOM keeps overall threshold above
+            // zero in practice, but keep the guard for any future
+            // change that lowers headroom too.
             if ( overrunThreshold == 0 ) overrunThreshold = 1;
             int drops = 0;
             while ( m_JitterBuffer.size() > overrunThreshold &&

@@ -116,27 +116,59 @@ class CDvFramePacket;  // pointer-only use for m_pLastVoiceInJitter
 // not captured by the percentile.
 #define JITTER_RTT_SAFETY_MARGIN_MS             30
 
-// Overrun protection — if buffer occupancy exceeds the target by this
-// ratio (2/1 = 2.0x), drop the oldest packet to drain back toward
-// target. Listener hears one 20 ms gap; cadence recovers.
+// Overrun protection — if buffer occupancy exceeds the threshold,
+// drop the oldest packet to drain back toward target. Listener hears
+// one 20 ms gap; cadence recovers.
 //
-// Why 2.0x not 1.5x: typical multi-frame source bursts (NXDN 4-per-
-// UDP, YSF 5-per-UDP) tip a near-target buffer over a 1.5x threshold
-// regularly under normal traffic, dropping audio that didn't need to
-// be dropped. At 137 ms target (~6 packets steady-state), 2.0x gives
-// 13-packet threshold — a 5-frame YSF burst at occupancy 8 = 13
-// packets which is at-but-not-over threshold (no drop). Verified
-// against production logs from MW0MWZ/xlxd ~May 2026.
+// Threshold is the MAX of two computations:
 //
-// Why not higher (e.g. 2.5x): peak buffered audio at the moment of
-// first drop is target × ratio. At MAX_JITTER_DELAY_MS = 400 ms,
-// 2.0x → 800 ms peak (uncomfortable but tolerable for non-realtime
+//   ratio    = target_pkts × (NUM/DEN) = target_pkts × 2.0
+//   additive = target_pkts + JITTER_OVERRUN_BURST_HEADROOM
+//
+// The two paths target different operating regions and the larger
+// of the two wins:
+//
+//   - At small targets (e.g. 160 ms = 8 pkts cold-start, where the
+//     adaptive buffer spends most time on healthy LANs), 2.0x = 16
+//     and additive = 8+12 = 20. Additive wins — gives enough burst
+//     headroom to absorb a one-shot WAN catch-up spike of 9-10
+//     frames without dropping. (Production observed peak=17 at
+//     target=8 with arrival_max=159 ms; 12 headroom gives 3-packet
+//     margin against larger gaps that the adaptive recompute hasn't
+//     seen yet.) Crossover where ratio meets additive: target_pkts
+//     = JITTER_OVERRUN_BURST_HEADROOM, i.e. target = 240 ms.
+//
+//   - At large targets (e.g. 400 ms ceiling on noisy WAN), 2.0x =
+//     40 and additive = 20+12 = 32. Ratio wins — the headroom is
+//     already absorbed into the larger target itself, so the
+//     ratio's "scale-with-target" property dominates. Peak buffered
+//     audio at MAX target is 40 × 20 ms = 800 ms. Above that audio
+//     latency breaks real-time conversation regardless.
+//
+// Why 2.0x not 1.5x for the ratio: typical multi-frame source bursts
+// (NXDN 4-per-UDP, YSF 5-per-UDP) tipped a near-target buffer over a
+// 1.5x threshold regularly under normal traffic, dropping audio that
+// didn't need to be dropped. 2.0x is the upper bound of what's still
+// useable for real-time conversation at the MAX target.
+//
+// Why not higher (e.g. 2.5x): peak buffered audio at MAX target is
+// target × ratio. 2.0x → 800 ms peak (tolerable for non-realtime
 // comms), 2.5x → 1000 ms (breaks conversational feel), 3.0x → 1200
-// ms (unusable). 2.0x is the upper bound of what's still useable.
-// If you raise this, also lower MAX_JITTER_DELAY_MS or accept
-// poor real-time conversation behaviour on noisy WAN paths.
+// ms (unusable). If you raise the ratio, also lower
+// MAX_JITTER_DELAY_MS or accept poor real-time conversation
+// behaviour on noisy WAN paths.
 #define JITTER_OVERRUN_RATIO_NUM                2
 #define JITTER_OVERRUN_RATIO_DEN                1
+
+// Additive burst headroom (in packets) above target. Sized to absorb
+// a single WAN-side catch-up burst when source delivery has paused.
+// 12 packets = 240 ms of buffered audio on top of target. Production
+// captured peak=17 at target=8 with arrival_max=159 ms (excess of 9
+// over target); 12 leaves 3 packets of margin against larger gaps
+// (e.g. a 200 ms WAN pause delivering 10 catch-up frames). Smaller
+// values (8-10) work for the observed case but leave a thin margin
+// for the next-larger burst event.
+#define JITTER_OVERRUN_BURST_HEADROOM           12
 
 // Cap on overrun-drops per Phase 2 invocation. Higher than the
 // release cap (3) because dropping is cheaper than encoding+sending,
@@ -218,7 +250,8 @@ public:
     // jitter delay over the stream's lifetime; an unchanged value
     // across the stream means conditions never deviated from the
     // initial estimate. Overrun drop count = packets evicted from the
-    // jitter buffer's head because occupancy exceeded 1.5x target.
+    // jitter buffer's head because occupancy exceeded the hybrid
+    // threshold max(2.0x target, target + JITTER_OVERRUN_BURST_HEADROOM).
     unsigned int GetJitterTargetMin(void) const { return m_TargetSamples > 0 ? m_TargetMin : m_CurrentJitterDelayMs; }
     unsigned int GetJitterTargetMax(void) const { return m_TargetSamples > 0 ? m_TargetMax : m_CurrentJitterDelayMs; }
     unsigned int GetJitterTargetAvg(void) const { return m_TargetSamples > 0 ? (unsigned int)(m_TargetSum / m_TargetSamples) : m_CurrentJitterDelayMs; }
@@ -403,7 +436,8 @@ protected:
     // Stats tracking for the close-time log line. min/avg/max of the
     // active jitter delay seen during this stream's lifetime, plus a
     // count of overrun-drops (Phase 2 dropped a packet because buffer
-    // exceeded 1.5x the active target).
+    // exceeded the hybrid threshold — see JITTER_OVERRUN_RATIO_NUM
+    // and JITTER_OVERRUN_BURST_HEADROOM in the constants block).
     unsigned int                               m_TargetMin;
     unsigned int                               m_TargetMax;
     uint64_t                                   m_TargetSum;
