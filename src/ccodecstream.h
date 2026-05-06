@@ -117,14 +117,37 @@ class CDvFramePacket;  // pointer-only use for m_pLastVoiceInJitter
 #define JITTER_RTT_SAFETY_MARGIN_MS             30
 
 // Overrun protection — if buffer occupancy exceeds the target by this
-// ratio (3/2 = 1.5x), drop the oldest packet to drain back toward
+// ratio (2/1 = 2.0x), drop the oldest packet to drain back toward
 // target. Listener hears one 20 ms gap; cadence recovers.
-#define JITTER_OVERRUN_RATIO_NUM                3
-#define JITTER_OVERRUN_RATIO_DEN                2
+//
+// Why 2.0x not 1.5x: typical multi-frame source bursts (NXDN 4-per-
+// UDP, YSF 5-per-UDP) tip a near-target buffer over a 1.5x threshold
+// regularly under normal traffic, dropping audio that didn't need to
+// be dropped. At 137 ms target (~6 packets steady-state), 2.0x gives
+// 13-packet threshold — a 5-frame YSF burst at occupancy 8 = 13
+// packets which is at-but-not-over threshold (no drop). Verified
+// against production logs from MW0MWZ/xlxd ~May 2026.
+//
+// Why not higher (e.g. 2.5x): peak buffered audio at the moment of
+// first drop is target × ratio. At MAX_JITTER_DELAY_MS = 400 ms,
+// 2.0x → 800 ms peak (uncomfortable but tolerable for non-realtime
+// comms), 2.5x → 1000 ms (breaks conversational feel), 3.0x → 1200
+// ms (unusable). 2.0x is the upper bound of what's still useable.
+// If you raise this, also lower MAX_JITTER_DELAY_MS or accept
+// poor real-time conversation behaviour on noisy WAN paths.
+#define JITTER_OVERRUN_RATIO_NUM                2
+#define JITTER_OVERRUN_RATIO_DEN                1
 
 // Cap on overrun-drops per Phase 2 invocation. Higher than the
 // release cap (3) because dropping is cheaper than encoding+sending,
 // so we can drain harder than we release.
+//
+// Intentionally smaller than worst-case excess (e.g. a one-shot
+// 25-packet burst at MAX-target threshold of 40 packets won't be
+// fully drained in one Phase 2 tick). Excess bleeds across multiple
+// ticks at this rate. Don't raise this thinking it'll "fix" overrun
+// faster — the slow-bleed behaviour limits cadence-stutter density
+// for the listener.
 #define JITTER_OVERRUN_DROP_CAP                 8
 
 // Maximum inter-arrival sample we treat as jitter (microseconds).
@@ -287,6 +310,15 @@ protected:
     std::queue<CPacket *>  m_JitterBuffer;
     std::chrono::steady_clock::time_point m_NextReleaseTime;
     bool            m_bJitterBufferStarted;
+
+    // Latches true at the first successful Phase 2 release. Gate for
+    // the overrun-drop logic: while this is false the buffer is
+    // accepting the initial fill (which legitimately includes the
+    // pre-codec ring buffer replay following the AMBEd handshake —
+    // up to 100 frames pushed in microseconds), and we don't want
+    // to drop any of that. Once Phase 2 has released anything we're
+    // in normal operation and overrun protection becomes meaningful.
+    bool            m_bFirstReleaseDone;
 
     // Lookup index from the uint8 PID echoed in ambed responses to the
     // CDvFramePacket currently sitting in m_JitterBuffer. Non-owning —

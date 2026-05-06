@@ -107,6 +107,7 @@ CCodecStream::CCodecStream(CPacketStream *PacketStream, uint16 uiId, uint8 uiCod
     m_uiUnfilledReleases = 0;
     m_PacketStream = PacketStream;
     m_bJitterBufferStarted = false;
+    m_bFirstReleaseDone = false;
     m_iInFlightPackets = 0;
     m_bSlowDataInit = false;
     m_uiSlowDataCycle = 0;
@@ -683,14 +684,15 @@ void CCodecStream::Task(void)
     if ( m_bJitterBufferStarted && !m_JitterBuffer.empty() )
     {
         // Overrun protection: if the jitter buffer is bloating beyond
-        // 1.5x the target capacity, the source has been delivering
-        // faster than expected (bursty BM bridge, network catching up
-        // after a brief stall). Drop oldest packets back toward the
-        // target. Listener hears one 20 ms cadence stutter per drop;
-        // alternative would be a permanent latency increase.
+        // the target capacity by JITTER_OVERRUN_RATIO_NUM /
+        // JITTER_OVERRUN_RATIO_DEN (currently 2.0x), the source has
+        // been delivering faster than the buffer can drain. Drop
+        // oldest packets back toward the target. Listener hears one
+        // 20 ms cadence stutter per drop; alternative would be
+        // permanent latency growth.
         //
         // Drop-OLDEST chosen over drop-newest because (a) old audio
-        // has already been delayed by m_CurrentJitterDelayMs, so it's
+        // has already been delayed by m_CurrentJitterDelayMs so it's
         // closer to "stale" than freshly-arrived audio, and (b) drop-
         // newest would corrupt cadence at the front of the queue.
         //
@@ -701,48 +703,66 @@ void CCodecStream::Task(void)
         // listeners). Increment m_uiOverrunDrops for the close-time
         // diagnostic.
         //
-        // Cap higher than the release cap (8 vs 3) because dropping
-        // is cheaper than encoding+sending — we can drain harder than
-        // we release, which prevents sustained 1.5x+ input from
-        // permanently keeping the buffer over threshold.
-        // Compute the threshold in ms FIRST, then divide by frame-ms.
+        // Initial-fill exemption: while m_bFirstReleaseDone is false
+        // we're still in the JITTER_BUFFER_DELAY_MS warmup window
+        // before any packet has been released to listeners. The
+        // buffer is allowed to grow during this window because the
+        // pre-codec ring buffer in CPacketStream (capped at 100
+        // frames, ~2 s of audio) deliberately replays accumulated
+        // frames in microseconds when AttachCodecStream completes
+        // after the AMBEd handshake. That replay burst is *intended*
+        // to preserve audio across the handshake delay; running
+        // overrun protection during it self-defeats — listener gets
+        // stutters instead of the deferred-but-intact audio we
+        // designed for. Once Phase 2 has released anything we know
+        // we're past the handshake replay and overrun is meaningful.
+        //
+        // Drop cap is JITTER_OVERRUN_DROP_CAP (8) per Phase 2 tick.
+        // Intentionally smaller than worst-case excess so a single
+        // large overflow bleeds across multiple ticks rather than
+        // creating a single huge cadence-stutter event. See the
+        // constant's header comment for the trade-off rationale.
+        //
+        // Threshold computation: ms first, then divide by frame-ms.
         // Doing it the other way around (packets first, then ratio)
-        // truncates twice and drifts away from the nominal 1.5x for
-        // any target that isn't a multiple of 20 ms (e.g. 90 ms target
-        // → 4 packets → 6 threshold = effective 1.33x not 1.5x).
-        size_t overrunThresholdMs =
-            ((size_t)m_CurrentJitterDelayMs * JITTER_OVERRUN_RATIO_NUM) /
-            JITTER_OVERRUN_RATIO_DEN;
-        size_t overrunThreshold = overrunThresholdMs / JITTER_BUFFER_FRAME_MS;
-        // Belt-and-braces: if anyone ever lowers MIN_JITTER_DELAY_MS
-        // below FRAME_MS, the threshold floors to zero and the loop
-        // would drop everything. Guard against that future regression.
-        if ( overrunThreshold == 0 ) overrunThreshold = 1;
-        int drops = 0;
-        while ( m_JitterBuffer.size() > overrunThreshold &&
-                drops < JITTER_OVERRUN_DROP_CAP )
+        // truncates twice and drifts away from the nominal ratio for
+        // any target that isn't a multiple of 20 ms.
+        if ( m_bFirstReleaseDone )
         {
-            CPacket *oldest = m_JitterBuffer.front();
-
-            if ( oldest == m_pLastVoiceInJitter )
+            size_t overrunThresholdMs =
+                ((size_t)m_CurrentJitterDelayMs * JITTER_OVERRUN_RATIO_NUM) /
+                JITTER_OVERRUN_RATIO_DEN;
+            size_t overrunThreshold = overrunThresholdMs / JITTER_BUFFER_FRAME_MS;
+            // Belt-and-braces: if anyone ever lowers MIN_JITTER_DELAY_MS
+            // below FRAME_MS, the threshold floors to zero and the loop
+            // would drop everything. Guard against that future regression.
+            if ( overrunThreshold == 0 ) overrunThreshold = 1;
+            int drops = 0;
+            while ( m_JitterBuffer.size() > overrunThreshold &&
+                    drops < JITTER_OVERRUN_DROP_CAP )
             {
-                m_pLastVoiceInJitter = NULL;
-            }
+                CPacket *oldest = m_JitterBuffer.front();
 
-            for ( auto mIt = m_PendingTranscode.begin();
-                  mIt != m_PendingTranscode.end(); ++mIt )
-            {
-                if ( mIt->second == (CDvFramePacket *)oldest )
+                if ( oldest == m_pLastVoiceInJitter )
                 {
-                    m_PendingTranscode.erase(mIt);
-                    break;
+                    m_pLastVoiceInJitter = NULL;
                 }
-            }
 
-            m_JitterBuffer.pop();
-            delete oldest;
-            m_uiOverrunDrops++;
-            drops++;
+                for ( auto mIt = m_PendingTranscode.begin();
+                      mIt != m_PendingTranscode.end(); ++mIt )
+                {
+                    if ( mIt->second == (CDvFramePacket *)oldest )
+                    {
+                        m_PendingTranscode.erase(mIt);
+                        break;
+                    }
+                }
+
+                m_JitterBuffer.pop();
+                delete oldest;
+                m_uiOverrunDrops++;
+                drops++;
+            }
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -794,6 +814,17 @@ void CCodecStream::Task(void)
         }
         // Mark packets as in-flight before releasing the lock
         m_iInFlightPackets += (int)toRelease.size();
+
+        // Latch first-release-done. Gates the overrun-drop block above
+        // so the initial pre-codec replay burst (which can dump up to
+        // PRE_CODEC_BUFFER_MAX = 100 frames into the buffer in micro-
+        // seconds following the AMBEd handshake) isn't pruned. Once
+        // Phase 2 has released anything we're past the replay window
+        // and overrun protection becomes meaningful.
+        if ( !m_bFirstReleaseDone && !toRelease.empty() )
+        {
+            m_bFirstReleaseDone = true;
+        }
     }
     Unlock();
 
