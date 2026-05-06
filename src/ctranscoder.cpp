@@ -324,34 +324,66 @@ void CTranscoder::ReleaseStream(CCodecStream *stream)
                     EncodeClosestreamPacket(&Buffer, m_Streams[i]->GetStreamId());
                     m_Socket.Send(Buffer, m_Ip, TRANSCODER_PORT);
                     
-                    // display stats. Two health counters added with the
-                    // ambed-decoupling rework: lookup_misses = ambed
-                    // responses that arrived after the jitter timer had
-                    // already released the packet (LAN return-path loss
-                    // or ambed RTT > JITTER_BUFFER_DELAY_MS); unfilled =
-                    // jitter-pops where ambed never responded at all
-                    // (LAN forward-path loss or ambed offline). Both
-                    // are zero in a healthy deployment. Non-zero values
+                    // and close it. Close() sets m_bStopThread on the
+                    // codec stream and joins its Task thread. After
+                    // Close() returns, the codec thread is no longer
+                    // touching any of the stream's stats fields, so
+                    // they're safe to read without locking. (Reading
+                    // them BEFORE Close() would race the still-running
+                    // Task() thread which writes m_uiReturnedPackets,
+                    // m_uiResponseLookupMisses, m_uiUnfilledReleases,
+                    // m_uiOverrunDrops, and the m_TargetMin/Max/Sum/
+                    // Samples set every recompute — none of those are
+                    // atomic.)
+                    m_Streams[i]->Close();
+
+                    // display stats:
+                    //   ping min/avg/max — round-trip time to ambed
+                    //   sent / returned — packets sent to ambed / popped
+                    //                     from jitter (should match)
+                    //   late — ambed responses that arrived after the
+                    //          jitter timer had already released the
+                    //          packet (LAN return-path loss or ambed
+                    //          RTT > current jitter target)
+                    //   unfilled — jitter pops where ambed never
+                    //              responded at all (LAN forward-path
+                    //              loss or ambed offline)
+                    //   jitter min/avg/max — adaptive jitter delay
+                    //                        target the buffer self-tuned
+                    //                        to during the stream (in ms)
+                    //   drops — overrun protection drops (buffer
+                    //           bloated > 1.5x target, oldest packets
+                    //           dropped to recover cadence)
+                    //
+                    // late/unfilled/drops should all be zero in a
+                    // healthy deployment. Non-zero late/unfilled values
                     // mean some other-mode listeners heard ~20 ms of
                     // silence per affected frame; D-Star pass-through
-                    // audio is unaffected by either.
+                    // audio is unaffected by either. Non-zero drops
+                    // means a sustained input overrun (bursty source
+                    // exceeding ambed throughput); listeners hear a
+                    // brief cadence stutter per drop.
                     {
-                        char sz[320];
+                        char sz[480];
                         uint32 sent = m_Streams[i]->GetTotalPackets();
                         uint32 returned = m_Streams[i]->GetReturnedPackets();
                         uint32 lookupMisses = m_Streams[i]->GetResponseLookupMisses();
                         uint32 unfilled = m_Streams[i]->GetUnfilledReleases();
+                        unsigned int jitterMin = m_Streams[i]->GetJitterTargetMin();
+                        unsigned int jitterAvg = m_Streams[i]->GetJitterTargetAvg();
+                        unsigned int jitterMax = m_Streams[i]->GetJitterTargetMax();
+                        uint32 drops = m_Streams[i]->GetOverrunDrops();
                         snprintf(sz, sizeof(sz),
-                                "ambed stats (ms) : %.1f/%.1f/%.1f — %d sent, %d returned, %d late, %d unfilled",
+                                "ambed stats (ms) : %.1f/%.1f/%.1f — %d sent, %d returned, "
+                                "%d late, %d unfilled, jitter %u/%u/%u ms, %u drops",
                                 m_Streams[i]->GetPingMin() * 1000.0,
                                 m_Streams[i]->GetPingAve() * 1000.0,
                                 m_Streams[i]->GetPingMax() * 1000.0,
-                                sent, returned, lookupMisses, unfilled);
+                                sent, returned, lookupMisses, unfilled,
+                                jitterMin, jitterAvg, jitterMax, drops);
                         std::cout << sz << std::endl;
                     }
 
-                    // and close it
-                    m_Streams[i]->Close();
                     delete m_Streams[i];
                     m_Streams.erase(m_Streams.begin()+i);
                     found = true;

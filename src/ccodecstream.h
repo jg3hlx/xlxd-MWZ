@@ -26,6 +26,7 @@
 #define ccodecstream_h
 
 #include <atomic>
+#include <array>
 #include <queue>
 #include <chrono>
 #include <unordered_map>
@@ -43,13 +44,100 @@ class CDvFramePacket;  // pointer-only use for m_pLastVoiceInJitter
 // define
 
 // Jitter buffer configuration
-// JITTER_BUFFER_DELAY_MS: Initial buffering delay before releasing packets.
-// This absorbs ambed latency variation (observed 8-144ms range).
-// Set to ~2x average ambed latency to handle most jitter.
-#define JITTER_BUFFER_DELAY_MS      160
+//
+// Adaptive jitter buffer — sizes itself per-stream based on observed
+// ambed RTT and source-side inter-arrival jitter. The buffer's job is
+// to absorb both: provide enough lead-time that ambed responses fill
+// in transcoded slots before Phase 2 releases the packet to listeners,
+// and absorb bursty source delivery (BM-bridged DMR can deliver
+// frames in 100-500 ms bursts) so listener output stays at 50 fps.
+//
+// Cold-start: each new stream begins at JITTER_BUFFER_DELAY_MS
+// (the safe default) until the warmup samples accumulate. After
+// warmup, target is recomputed every JITTER_RECOMPUTE_FRAMES from
+// the sliding-window samples.
+//
+// Adaptation policy (asymmetric hysteresis):
+//   - Increase target immediately when conditions degrade (delta > +20 ms).
+//     Network getting worse is an emergency; lookup-misses pile up
+//     fast if we lag.
+//   - Decrease target only after JITTER_DOWN_ADAPT_AGREE_COUNT
+//     consecutive recomputes agree (delta < -20 ms each time).
+//     Improving conditions can wait; oversized buffer only adds
+//     latency, doesn't break anything.
+//
+// Floor: MIN_JITTER_DELAY_MS keeps a safety margin even on a
+// near-perfect LAN — first-frame ambed RTT after a cold-start can
+// spike well above the steady-state mean.
+//
+// Ceiling: MAX_JITTER_DELAY_MS prevents pathological network jitter
+// from inflating audio latency without bound.
 
-// JITTER_BUFFER_FRAME_MS: Interval between releasing packets (voice frame duration)
-#define JITTER_BUFFER_FRAME_MS      20
+// Initial buffering delay used at stream open and during the warmup
+// window before adaptation kicks in. Adaptation will shrink this
+// when measured conditions allow. 160 ms = ~2x typical ambed RTT
+// for the original deployments this code was tuned for.
+#define JITTER_BUFFER_DELAY_MS                  160
+
+// Adaptation floor — never let the buffer drop below this even on a
+// pristine LAN. 80 ms is 2x typical ambed RTT (~40 ms) plus margin
+// for the first frame after a silence-gap, where ambed's USB
+// pipeline may not be primed.
+#define MIN_JITTER_DELAY_MS                     80
+
+// Adaptation ceiling — pathological network jitter shouldn't be
+// allowed to inflate audio latency unboundedly. Above 400 ms the
+// audio is so delayed that real-time conversation breaks down anyway.
+#define MAX_JITTER_DELAY_MS                     400
+
+// Sliding window size for both RTT and source-arrival samples. 100
+// samples = ~2 seconds at 50 fps, long enough for stable percentile
+// estimates without lagging too far behind real network conditions.
+#define JITTER_SAMPLE_WINDOW                    100
+
+// Recompute the target every N frames. 50 = once per second. Smaller
+// = more responsive but more CPU. 50 was chosen to match the warmup
+// threshold so the first recompute happens at exactly the moment we
+// have enough samples to be statistically meaningful.
+#define JITTER_RECOMPUTE_FRAMES                 50
+
+// Hysteresis threshold for applying a new target (in ms). Smaller =
+// more sensitive but risks oscillation around marginal thresholds.
+#define JITTER_RECOMPUTE_HYSTERESIS_MS          20
+
+// Asymmetric down-adapt: require this many consecutive recomputes to
+// all want a smaller target before applying one. Damps oscillation
+// when network is borderline. 3 recomputes = 3 seconds of consistent
+// improvement before we shrink.
+#define JITTER_DOWN_ADAPT_AGREE_COUNT           3
+
+// Safety margin (in ms) added to the RTT P95 when computing the new
+// target. Covers measurement quantisation and short-term variability
+// not captured by the percentile.
+#define JITTER_RTT_SAFETY_MARGIN_MS             30
+
+// Overrun protection — if buffer occupancy exceeds the target by this
+// ratio (3/2 = 1.5x), drop the oldest packet to drain back toward
+// target. Listener hears one 20 ms gap; cadence recovers.
+#define JITTER_OVERRUN_RATIO_NUM                3
+#define JITTER_OVERRUN_RATIO_DEN                2
+
+// Cap on overrun-drops per Phase 2 invocation. Higher than the
+// release cap (3) because dropping is cheaper than encoding+sending,
+// so we can drain harder than we release.
+#define JITTER_OVERRUN_DROP_CAP                 8
+
+// Maximum inter-arrival sample we treat as jitter (microseconds).
+// Anything above this is a stall (silence gap, network outage,
+// source PTT release) rather than jitter — admitting such a sample
+// would pin the buffer at MAX for the rest of the window. Suppress
+// instead. 500 ms is well past any reasonable per-frame variability
+// and well short of typical conversational pauses.
+#define JITTER_ARRIVAL_MAX_SAMPLE_US            500000
+
+// JITTER_BUFFER_FRAME_MS: Interval between releasing packets (voice frame duration).
+// Constant — listeners expect 50 fps output cadence regardless of source.
+#define JITTER_BUFFER_FRAME_MS                  20
 
 // frame sizes
 #define AMBE_SIZE           9
@@ -103,6 +191,15 @@ public:
     uint32 GetReturnedPackets(void) const   { return m_uiReturnedPackets; }
     uint32 GetResponseLookupMisses(void) const { return m_uiResponseLookupMisses; }
     uint32 GetUnfilledReleases(void) const     { return m_uiUnfilledReleases; }
+    // Adaptive jitter buffer stats. Min/avg/max of the active target
+    // jitter delay over the stream's lifetime; an unchanged value
+    // across the stream means conditions never deviated from the
+    // initial estimate. Overrun drop count = packets evicted from the
+    // jitter buffer's head because occupancy exceeded 1.5x target.
+    unsigned int GetJitterTargetMin(void) const { return m_TargetSamples > 0 ? m_TargetMin : m_CurrentJitterDelayMs; }
+    unsigned int GetJitterTargetMax(void) const { return m_TargetSamples > 0 ? m_TargetMax : m_CurrentJitterDelayMs; }
+    unsigned int GetJitterTargetAvg(void) const { return m_TargetSamples > 0 ? (unsigned int)(m_TargetSum / m_TargetSamples) : m_CurrentJitterDelayMs; }
+    uint32       GetOverrunDrops(void) const   { return m_uiOverrunDrops; }
     bool   IsEmpty(void) const;
     size_t GetDepth(void) const;
 
@@ -211,6 +308,65 @@ protected:
     // mis-paired transcoded slots when any single response was dropped.
     std::unordered_map<uint8, CDvFramePacket *> m_PendingTranscode;
 
+    // Adaptive jitter buffer state — see the JITTER_* constants block
+    // at the top of this file for the algorithm rationale.
+    //
+    // Both sample rings are circular buffers (m_*SampleIdx is the
+    // next-write position; m_*SampleCount tracks how many have been
+    // written so far, capped at JITTER_SAMPLE_WINDOW). All access is
+    // under CCodecStream::Lock() — the same critical section that
+    // already protects m_JitterBuffer and m_PendingTranscode.
+    //
+    // Units: microseconds for sample storage (uint32 fits ~71 minutes),
+    // milliseconds for the active target. The unit-in-the-name
+    // convention prevents the "is this μs or ms?" debugging pitfall.
+    std::array<uint32, JITTER_SAMPLE_WINDOW>   m_RttSamplesUs;
+    unsigned int                               m_RttSampleIdx;
+    unsigned int                               m_RttSampleCount;
+
+    std::array<uint32, JITTER_SAMPLE_WINDOW>   m_ArrivalSamplesUs;
+    unsigned int                               m_ArrivalSampleIdx;
+    unsigned int                               m_ArrivalSampleCount;
+
+    // Inter-arrival timing. m_LastPushTime is the wall-clock of the
+    // previous Phase 3 push; the delta to "now" is one inter-arrival
+    // sample. m_bHasLastPushTime guards against (a) the very first
+    // push of the stream where there is no previous time, and (b) the
+    // first push after a silence-gap (where the delta would be the
+    // gap duration, which is signal noise rather than jitter — we
+    // suppress sampling for that frame).
+    std::chrono::steady_clock::time_point      m_LastPushTime;
+    bool                                       m_bHasLastPushTime;
+
+    // Currently-active jitter delay. Initialised to JITTER_BUFFER_DELAY_MS
+    // (the safe default) at construction; the cold-start window before
+    // adaptation kicks in keeps it there while RTT samples accumulate.
+    // After warmup, RecomputeJitterTarget() updates it every
+    // JITTER_RECOMPUTE_FRAMES frames using the asymmetric hysteresis
+    // policy described above the JITTER_* constants block.
+    unsigned int                               m_CurrentJitterDelayMs;
+
+    // Frame counter for the recompute trigger. Incremented per Phase 3
+    // push; recompute fires when this reaches JITTER_RECOMPUTE_FRAMES
+    // AND we have at least JITTER_SAMPLE_WINDOW/2 RTT samples.
+    unsigned int                               m_FramesSinceRecompute;
+
+    // Counts consecutive recomputes that all wanted a smaller target.
+    // Reset to 0 on any recompute that wants larger or within-
+    // hysteresis. Down-adapt is applied only when this reaches
+    // JITTER_DOWN_ADAPT_AGREE_COUNT (slow-down asymmetry).
+    unsigned int                               m_AgreeingDownAdapts;
+
+    // Stats tracking for the close-time log line. min/avg/max of the
+    // active jitter delay seen during this stream's lifetime, plus a
+    // count of overrun-drops (Phase 2 dropped a packet because buffer
+    // exceeded 1.5x the active target).
+    unsigned int                               m_TargetMin;
+    unsigned int                               m_TargetMax;
+    uint64_t                                   m_TargetSum;
+    unsigned int                               m_TargetSamples;
+    uint32                                     m_uiOverrunDrops;
+
     // In-flight counter: packets popped from jitter buffer but not yet
     // pushed to the packet stream. Prevents IsEmpty() from returning true
     // during the Phase 2 gap between jitter-pop and stream-push.
@@ -274,6 +430,14 @@ protected:
     // m_SlowData via SetText() and SetHeaderSync(). Safe to call
     // repeatedly — re-seeds both buffers each time.
     void InitSlowData(void);
+
+    // Adaptive jitter buffer recompute. Called from Phase 3 every
+    // JITTER_RECOMPUTE_FRAMES frames once the warmup window has at
+    // least JITTER_SAMPLE_WINDOW/2 RTT samples. Reads m_RttSamplesUs
+    // and m_ArrivalSamplesUs, computes the new target, applies it
+    // via the asymmetric hysteresis policy. Caller must hold
+    // CCodecStream::Lock().
+    void RecomputeJitterTarget(void);
 };
 
 

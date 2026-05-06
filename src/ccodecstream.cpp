@@ -28,6 +28,7 @@
 #include <vector>
 #include <chrono>
 #include <future>
+#include <algorithm>
 #include "ccodecstream.h"
 #include "cdvframepacket.h"
 #include "cpacketstream.h"
@@ -110,6 +111,27 @@ CCodecStream::CCodecStream(CPacketStream *PacketStream, uint16 uiId, uint8 uiCod
     m_bSlowDataInit = false;
     m_uiSlowDataCycle = 0;
     m_pLastVoiceInJitter = NULL;
+
+    // Adaptive jitter buffer state — fresh per stream, no
+    // cross-stream learning. Cold-start at JITTER_BUFFER_DELAY_MS
+    // (the safe default); RecomputeJitterTarget will adapt downward
+    // toward MIN_JITTER_DELAY_MS once the warmup samples accumulate
+    // and conditions are observed to be benign.
+    m_RttSamplesUs.fill(0);
+    m_RttSampleIdx = 0;
+    m_RttSampleCount = 0;
+    m_ArrivalSamplesUs.fill(0);
+    m_ArrivalSampleIdx = 0;
+    m_ArrivalSampleCount = 0;
+    m_bHasLastPushTime = false;
+    m_CurrentJitterDelayMs = JITTER_BUFFER_DELAY_MS;
+    m_FramesSinceRecompute = 0;
+    m_AgreeingDownAdapts = 0;
+    m_TargetMin = 0;
+    m_TargetMax = 0;
+    m_TargetSum = 0;
+    m_TargetSamples = 0;
+    m_uiOverrunDrops = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -395,6 +417,113 @@ void CCodecStream::InitSlowData(void)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
+// adaptive jitter buffer recompute
+//
+// Called from Phase 3 every JITTER_RECOMPUTE_FRAMES frames once the
+// RTT sample window is at least half-full. Caller must hold the
+// CCodecStream::Lock() (we're touching m_CurrentJitterDelayMs and
+// the sample arrays which other phases also touch).
+//
+// Algorithm:
+//   1. RTT P95 over the sample window (5th-largest of 100). Robust
+//      against single-sample outliers (one cosmic-ray ambed pause
+//      shouldn't pin the buffer for the next second).
+//   2. Source inter-arrival max over the sample window. Single-late
+//      delivery here HAS to be absorbed by the buffer or a frame
+//      gets stranded — no other safety net — so use max.
+//   3. Target = max(rtt_p95 + safety, arrival_max, MIN_floor),
+//      clamped to MAX_ceiling.
+//   4. Apply asymmetric hysteresis:
+//        - delta > +20 ms (target growing): apply immediately. Network
+//          degrading is an emergency; lookup-misses cost listeners audio.
+//        - delta < -20 ms (target shrinking): require 3 consecutive
+//          recomputes to all want a smaller target. Improving
+//          conditions can wait; oversized buffer only adds latency.
+//        - within hysteresis: no change, reset down-agree counter.
+void CCodecStream::RecomputeJitterTarget(void)
+{
+    // P95 of RTT samples (count * 95 / 100 in sorted ascending = 5th-
+    // largest for count=100). For partial windows during warmup, the
+    // formula falls back gracefully (count=20 → idx=19 = max).
+    //
+    // The m_RttSampleCount > 0 check is defence-in-depth — the call
+    // site in Phase 3 already gates on m_RttSampleCount >=
+    // JITTER_SAMPLE_WINDOW / 2 (50), so this branch never executes
+    // with count=0 in practice. Keep the guard so a future change to
+    // the call-site condition can't trigger UB on an empty sample
+    // window.
+    unsigned int rttP95Us = 0;
+    if ( m_RttSampleCount > 0 )
+    {
+        std::array<uint32, JITTER_SAMPLE_WINDOW> tmp;
+        std::copy(m_RttSamplesUs.begin(),
+                  m_RttSamplesUs.begin() + m_RttSampleCount,
+                  tmp.begin());
+        unsigned int idx = (m_RttSampleCount * 95) / 100;
+        if ( idx >= m_RttSampleCount ) idx = m_RttSampleCount - 1;
+        std::nth_element(tmp.begin(), tmp.begin() + idx,
+                         tmp.begin() + m_RttSampleCount);
+        rttP95Us = tmp[idx];
+    }
+
+    // Max of source inter-arrival samples.
+    unsigned int arrivalMaxUs = 0;
+    for ( unsigned int i = 0; i < m_ArrivalSampleCount; i++ )
+    {
+        if ( m_ArrivalSamplesUs[i] > arrivalMaxUs )
+        {
+            arrivalMaxUs = m_ArrivalSamplesUs[i];
+        }
+    }
+
+    // Convert to ms (round up — better to over-buffer than under).
+    unsigned int rttP95Ms = (rttP95Us + 999) / 1000;
+    unsigned int arrivalMaxMs = (arrivalMaxUs + 999) / 1000;
+
+    // Compute new target.
+    unsigned int newTarget = rttP95Ms + JITTER_RTT_SAFETY_MARGIN_MS;
+    if ( arrivalMaxMs > newTarget )    newTarget = arrivalMaxMs;
+    if ( newTarget < MIN_JITTER_DELAY_MS ) newTarget = MIN_JITTER_DELAY_MS;
+    if ( newTarget > MAX_JITTER_DELAY_MS ) newTarget = MAX_JITTER_DELAY_MS;
+
+    // Apply with asymmetric hysteresis.
+    int delta = (int)newTarget - (int)m_CurrentJitterDelayMs;
+    if ( delta > (int)JITTER_RECOMPUTE_HYSTERESIS_MS )
+    {
+        // Growing — apply immediately. Reset down-agree counter.
+        m_CurrentJitterDelayMs = newTarget;
+        m_AgreeingDownAdapts = 0;
+    }
+    else if ( delta < -(int)JITTER_RECOMPUTE_HYSTERESIS_MS )
+    {
+        // Shrinking — wait for sustained agreement.
+        m_AgreeingDownAdapts++;
+        if ( m_AgreeingDownAdapts >= JITTER_DOWN_ADAPT_AGREE_COUNT )
+        {
+            m_CurrentJitterDelayMs = newTarget;
+            m_AgreeingDownAdapts = 0;
+        }
+    }
+    else
+    {
+        // Within hysteresis — no change, reset down-agree counter.
+        m_AgreeingDownAdapts = 0;
+    }
+
+    // Track stats for the close-time log line.
+    if ( m_TargetSamples == 0 || m_CurrentJitterDelayMs < m_TargetMin )
+    {
+        m_TargetMin = m_CurrentJitterDelayMs;
+    }
+    if ( m_CurrentJitterDelayMs > m_TargetMax )
+    {
+        m_TargetMax = m_CurrentJitterDelayMs;
+    }
+    m_TargetSum += m_CurrentJitterDelayMs;
+    m_TargetSamples++;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////
 // thread
 
 void CCodecStream::Thread(CCodecStream *This)
@@ -496,6 +625,27 @@ void CCodecStream::Task(void)
             uint8 responsePid = Buffer.data()[TRANSCODER_PACKET_PID_OFFSET];
 
             Lock();
+
+            // Push RTT into the adaptive jitter buffer's sliding-window
+            // sample ring. ping is in seconds (per CTimePoint); convert
+            // to microseconds for storage. uint32 fits ~71 minutes —
+            // way more than any sane RTT.
+            //
+            // Guard against negative ping: m_StatsTimer uses steady_clock
+            // so ping should never go backwards, but if a future change
+            // ever switches to system_clock and the wall clock steps
+            // backwards mid-stream, the negative cast to uint32 becomes
+            // a huge value and pins the buffer at the ceiling for ~2
+            // seconds. Cheap guard.
+            double pingClamped = (ping > 0.0) ? ping : 0.0;
+            uint32 pingUs = (uint32)(pingClamped * 1.0e6);
+            m_RttSamplesUs[m_RttSampleIdx] = pingUs;
+            m_RttSampleIdx = (m_RttSampleIdx + 1) % JITTER_SAMPLE_WINDOW;
+            if ( m_RttSampleCount < JITTER_SAMPLE_WINDOW )
+            {
+                m_RttSampleCount++;
+            }
+
             auto it = m_PendingTranscode.find(responsePid);
             if ( it != m_PendingTranscode.end() )
             {
@@ -532,6 +682,69 @@ void CCodecStream::Task(void)
     Lock();
     if ( m_bJitterBufferStarted && !m_JitterBuffer.empty() )
     {
+        // Overrun protection: if the jitter buffer is bloating beyond
+        // 1.5x the target capacity, the source has been delivering
+        // faster than expected (bursty BM bridge, network catching up
+        // after a brief stall). Drop oldest packets back toward the
+        // target. Listener hears one 20 ms cadence stutter per drop;
+        // alternative would be a permanent latency increase.
+        //
+        // Drop-OLDEST chosen over drop-newest because (a) old audio
+        // has already been delayed by m_CurrentJitterDelayMs, so it's
+        // closer to "stale" than freshly-arrived audio, and (b) drop-
+        // newest would corrupt cadence at the front of the queue.
+        //
+        // Cleanup mirrors the release path: clear m_pLastVoiceInJitter
+        // if it aliases the dropped packet, erase the m_PendingTranscode
+        // entry if present (otherwise ambed's eventual response would
+        // count as a lookup-miss for a packet that never reached
+        // listeners). Increment m_uiOverrunDrops for the close-time
+        // diagnostic.
+        //
+        // Cap higher than the release cap (8 vs 3) because dropping
+        // is cheaper than encoding+sending — we can drain harder than
+        // we release, which prevents sustained 1.5x+ input from
+        // permanently keeping the buffer over threshold.
+        // Compute the threshold in ms FIRST, then divide by frame-ms.
+        // Doing it the other way around (packets first, then ratio)
+        // truncates twice and drifts away from the nominal 1.5x for
+        // any target that isn't a multiple of 20 ms (e.g. 90 ms target
+        // → 4 packets → 6 threshold = effective 1.33x not 1.5x).
+        size_t overrunThresholdMs =
+            ((size_t)m_CurrentJitterDelayMs * JITTER_OVERRUN_RATIO_NUM) /
+            JITTER_OVERRUN_RATIO_DEN;
+        size_t overrunThreshold = overrunThresholdMs / JITTER_BUFFER_FRAME_MS;
+        // Belt-and-braces: if anyone ever lowers MIN_JITTER_DELAY_MS
+        // below FRAME_MS, the threshold floors to zero and the loop
+        // would drop everything. Guard against that future regression.
+        if ( overrunThreshold == 0 ) overrunThreshold = 1;
+        int drops = 0;
+        while ( m_JitterBuffer.size() > overrunThreshold &&
+                drops < JITTER_OVERRUN_DROP_CAP )
+        {
+            CPacket *oldest = m_JitterBuffer.front();
+
+            if ( oldest == m_pLastVoiceInJitter )
+            {
+                m_pLastVoiceInJitter = NULL;
+            }
+
+            for ( auto mIt = m_PendingTranscode.begin();
+                  mIt != m_PendingTranscode.end(); ++mIt )
+            {
+                if ( mIt->second == (CDvFramePacket *)oldest )
+                {
+                    m_PendingTranscode.erase(mIt);
+                    break;
+                }
+            }
+
+            m_JitterBuffer.pop();
+            delete oldest;
+            m_uiOverrunDrops++;
+            drops++;
+        }
+
         auto now = std::chrono::steady_clock::now();
         int released = 0;
         // Cap at 3 releases per call to prevent bursting on catch-up
@@ -727,6 +940,42 @@ void CCodecStream::Task(void)
             m_pLastVoiceInJitter = fp;
         }
 
+        // Detect empty-buffer-resume BEFORE the push for the
+        // adaptive-jitter re-arm below. "Empty" means both the jitter
+        // buffer is empty AND no map entries are pending (defence-in-
+        // depth: a stranded map entry from some bug would otherwise
+        // suppress the re-arm and re-create the silence-gap pathology).
+        bool wasEmpty = m_JitterBuffer.empty() && m_PendingTranscode.empty();
+
+        // Source inter-arrival sample for the adaptive jitter buffer.
+        // Skip the first push of the stream (no previous time to delta
+        // against) and skip the first push after a silence gap (the
+        // delta would be the gap duration, which is signal noise rather
+        // than jitter — we don't want a 1-second silence to pin the
+        // buffer at 1000 ms for the next minute).
+        auto pushNow = std::chrono::steady_clock::now();
+        if ( m_bHasLastPushTime && !wasEmpty )
+        {
+            auto deltaUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                                pushNow - m_LastPushTime).count();
+            // Clamp to a sane range. Negative shouldn't happen on
+            // steady_clock, but bounds-check anyway. Upper bound
+            // suppresses stalls (silence gaps, source PTT release)
+            // from looking like enormous jitter — see
+            // JITTER_ARRIVAL_MAX_SAMPLE_US comment in the header.
+            if ( deltaUs > 0 && deltaUs < JITTER_ARRIVAL_MAX_SAMPLE_US )
+            {
+                m_ArrivalSamplesUs[m_ArrivalSampleIdx] = (uint32)deltaUs;
+                m_ArrivalSampleIdx = (m_ArrivalSampleIdx + 1) % JITTER_SAMPLE_WINDOW;
+                if ( m_ArrivalSampleCount < JITTER_SAMPLE_WINDOW )
+                {
+                    m_ArrivalSampleCount++;
+                }
+            }
+        }
+        m_LastPushTime = pushNow;
+        m_bHasLastPushTime = true;
+
         // Push into jitter buffer + lookup index. Both happen under
         // the same lock so a concurrent Phase 1 response handler can't
         // see the map entry without the corresponding jitter-buffer
@@ -735,11 +984,36 @@ void CCodecStream::Task(void)
         m_JitterBuffer.push(Packet);
         m_PendingTranscode[sendPid] = fp;
 
-        if ( !m_bJitterBufferStarted )
+        // Establish the jitter release schedule. Two cases:
+        //   - First push of the stream (m_bJitterBufferStarted false):
+        //     start the cadence at now + the current adaptive target.
+        //   - Push to a previously-empty buffer (silence-gap recovery):
+        //     re-arm to now + current target. Without this re-arm,
+        //     m_NextReleaseTime would still be at the time-of-last-pop
+        //     (frozen during the gap because Phase 2 only advances it
+        //     when popping, and during silence there's nothing to pop).
+        //     Post-gap frames would then match `now >= m_NextReleaseTime`
+        //     immediately and pop without sitting in the jitter buffer
+        //     at all, bypassing the entire absorption window for the
+        //     rest of the stream.
+        if ( !m_bJitterBufferStarted || wasEmpty )
         {
-            m_NextReleaseTime = std::chrono::steady_clock::now() +
-                                std::chrono::milliseconds(JITTER_BUFFER_DELAY_MS);
+            m_NextReleaseTime = pushNow +
+                                std::chrono::milliseconds(m_CurrentJitterDelayMs);
             m_bJitterBufferStarted = true;
+        }
+
+        // Recompute the adaptive target every JITTER_RECOMPUTE_FRAMES
+        // pushes once the warmup window is at least half-full of RTT
+        // samples. The half-full threshold (50 of 100) ensures the
+        // statistic is meaningful before we start shrinking from the
+        // safe default.
+        m_FramesSinceRecompute++;
+        if ( m_FramesSinceRecompute >= JITTER_RECOMPUTE_FRAMES &&
+             m_RttSampleCount >= JITTER_SAMPLE_WINDOW / 2 )
+        {
+            RecomputeJitterTarget();
+            m_FramesSinceRecompute = 0;
         }
 
         Unlock();
