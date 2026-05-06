@@ -364,7 +364,7 @@ void CTranscoder::ReleaseStream(CCodecStream *stream)
                     // exceeding ambed throughput); listeners hear a
                     // brief cadence stutter per drop.
                     {
-                        char sz[480];
+                        char sz[640];
                         uint32 sent = m_Streams[i]->GetTotalPackets();
                         uint32 returned = m_Streams[i]->GetReturnedPackets();
                         uint32 lookupMisses = m_Streams[i]->GetResponseLookupMisses();
@@ -373,14 +373,25 @@ void CTranscoder::ReleaseStream(CCodecStream *stream)
                         unsigned int jitterAvg = m_Streams[i]->GetJitterTargetAvg();
                         unsigned int jitterMax = m_Streams[i]->GetJitterTargetMax();
                         uint32 drops = m_Streams[i]->GetOverrunDrops();
+                        // Diagnostic instrumentation — see CCodecStream
+                        // getter comments. peak = max jitter buffer
+                        // occupancy this stream; arrival_max = longest
+                        // admitted source inter-arrival; first/last =
+                        // m_uiTotalPackets at first/last overrun drop.
+                        uint32 peak = m_Streams[i]->GetPeakBufferOccupancy();
+                        uint32 arrivalMax = m_Streams[i]->GetArrivalMaxMs();
+                        uint32 firstDrop = m_Streams[i]->GetFirstDropFrame();
+                        uint32 lastDrop = m_Streams[i]->GetLastDropFrame();
                         snprintf(sz, sizeof(sz),
                                 "ambed stats (ms) : %.1f/%.1f/%.1f — %d sent, %d returned, "
-                                "%d late, %d unfilled, jitter %u/%u/%u ms, %u drops",
+                                "%d late, %d unfilled, jitter %u/%u/%u ms, %u drops "
+                                "[peak=%u arrival_max=%ums drops@first=%u/last=%u]",
                                 m_Streams[i]->GetPingMin() * 1000.0,
                                 m_Streams[i]->GetPingAve() * 1000.0,
                                 m_Streams[i]->GetPingMax() * 1000.0,
                                 sent, returned, lookupMisses, unfilled,
-                                jitterMin, jitterAvg, jitterMax, drops);
+                                jitterMin, jitterAvg, jitterMax, drops,
+                                peak, arrivalMax, firstDrop, lastDrop);
                         std::cout << sz << std::endl;
                     }
 

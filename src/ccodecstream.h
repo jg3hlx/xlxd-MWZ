@@ -223,6 +223,17 @@ public:
     unsigned int GetJitterTargetMax(void) const { return m_TargetSamples > 0 ? m_TargetMax : m_CurrentJitterDelayMs; }
     unsigned int GetJitterTargetAvg(void) const { return m_TargetSamples > 0 ? (unsigned int)(m_TargetSum / m_TargetSamples) : m_CurrentJitterDelayMs; }
     uint32       GetOverrunDrops(void) const   { return m_uiOverrunDrops; }
+    // Diagnostic instrumentation. Peak jitter-buffer occupancy seen during
+    // the stream (max snapshot at every Phase 3 push). Source-arrival max
+    // in ms (live-tracked from the same samples that feed the adaptive
+    // jitter recompute). First/last frame index at which an overrun drop
+    // fired — the index is m_uiTotalPackets at drop time, i.e. "the Nth
+    // sent packet was the last frame before the drop." Both frame fields
+    // are zero if no drops occurred this stream.
+    uint32       GetPeakBufferOccupancy(void) const { return m_uiPeakBufferOccupancy; }
+    uint32       GetArrivalMaxMs(void) const        { return (m_uiArrivalMaxUs + 999) / 1000; }
+    uint32       GetFirstDropFrame(void) const      { return m_uiFirstDropFrame; }
+    uint32       GetLastDropFrame(void) const       { return m_uiLastDropFrame; }
     bool   IsEmpty(void) const;
     size_t GetDepth(void) const;
 
@@ -398,6 +409,15 @@ protected:
     uint64_t                                   m_TargetSum;
     unsigned int                               m_TargetSamples;
     uint32                                     m_uiOverrunDrops;
+
+    // Diagnostic instrumentation for the close-time stats line. All four
+    // are touched only under CCodecStream::Lock() — same critical section
+    // as the existing jitter state — so no separate synchronisation
+    // needed. See the public getters' header comment for semantics.
+    uint32                                     m_uiPeakBufferOccupancy;
+    uint32                                     m_uiArrivalMaxUs;
+    uint32                                     m_uiFirstDropFrame;
+    uint32                                     m_uiLastDropFrame;
 
     // In-flight counter: packets popped from jitter buffer but not yet
     // pushed to the packet stream. Prevents IsEmpty() from returning true

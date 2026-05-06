@@ -133,6 +133,12 @@ CCodecStream::CCodecStream(CPacketStream *PacketStream, uint16 uiId, uint8 uiCod
     m_TargetSum = 0;
     m_TargetSamples = 0;
     m_uiOverrunDrops = 0;
+
+    // Diagnostic instrumentation — fresh per stream.
+    m_uiPeakBufferOccupancy = 0;
+    m_uiArrivalMaxUs = 0;
+    m_uiFirstDropFrame = 0;
+    m_uiLastDropFrame = 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -761,6 +767,18 @@ void CCodecStream::Task(void)
                 m_JitterBuffer.pop();
                 delete oldest;
                 m_uiOverrunDrops++;
+
+                // Record drop position for diagnostics. m_uiTotalPackets
+                // is the count of packets pushed to ambed so far — i.e.
+                // "drop occurred after the Nth sent frame." First non-zero
+                // sets first; every drop overwrites last. Tells us at a
+                // glance whether drops cluster at start, mid, or end.
+                if ( m_uiFirstDropFrame == 0 )
+                {
+                    m_uiFirstDropFrame = m_uiTotalPackets;
+                }
+                m_uiLastDropFrame = m_uiTotalPackets;
+
                 drops++;
             }
         }
@@ -1002,6 +1020,16 @@ void CCodecStream::Task(void)
                 {
                     m_ArrivalSampleCount++;
                 }
+                // Diagnostic: live max of admitted (non-stall) inter-
+                // arrival deltas across the entire stream. The ring
+                // buffer that feeds RecomputeJitterTarget rotates and
+                // can lose the historical peak; this field is monotonic
+                // so the close-time stats line shows the worst burst
+                // gap observed during the whole stream.
+                if ( (uint32)deltaUs > m_uiArrivalMaxUs )
+                {
+                    m_uiArrivalMaxUs = (uint32)deltaUs;
+                }
             }
         }
         m_LastPushTime = pushNow;
@@ -1014,6 +1042,16 @@ void CCodecStream::Task(void)
         // jitter" inconsistency).
         m_JitterBuffer.push(Packet);
         m_PendingTranscode[sendPid] = fp;
+
+        // Diagnostic: track peak jitter-buffer occupancy seen during
+        // the stream. Sampled here (immediately after every push,
+        // before Phase 2 has had a chance to drain) — this is the
+        // post-push peak for each frame, which is the most relevant
+        // depth for sizing overrun thresholds.
+        if ( m_JitterBuffer.size() > m_uiPeakBufferOccupancy )
+        {
+            m_uiPeakBufferOccupancy = (uint32)m_JitterBuffer.size();
+        }
 
         // Establish the jitter release schedule. Two cases:
         //   - First push of the stream (m_bJitterBufferStarted false):
