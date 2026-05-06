@@ -426,6 +426,28 @@ void CStream::Close(void)
     // Close socket
     m_Socket.Close();
 
+    // Capture PID-FIFO desync drop counts BEFORE closing the channels —
+    // CVocodecChannel::Close calls PurgeAllQueues which resets the
+    // counters. We want to report the values that accumulated during
+    // this stream's lifetime, not 0.
+    uint32 totalOrphanDrops = 0;
+    uint32 totalOverflowDrops = 0;
+    if ( m_VocodecChannel != NULL )
+    {
+        totalOrphanDrops += m_VocodecChannel->GetPidFifoOrphanDrops();
+        totalOverflowDrops += m_VocodecChannel->GetPidFifoOverflowDrops();
+    }
+    if ( m_EncoderChannel1 != NULL )
+    {
+        totalOrphanDrops += m_EncoderChannel1->GetPidFifoOrphanDrops();
+        totalOverflowDrops += m_EncoderChannel1->GetPidFifoOverflowDrops();
+    }
+    if ( m_EncoderChannel2 != NULL )
+    {
+        totalOrphanDrops += m_EncoderChannel2->GetPidFifoOrphanDrops();
+        totalOverflowDrops += m_EncoderChannel2->GetPidFifoOverflowDrops();
+    }
+
     // Close and null vocodec channels
     if ( m_VocodecChannel != NULL )
     {
@@ -460,6 +482,18 @@ void CStream::Close(void)
 
     // Report
     std::cout << m_iLostPackets << " of " << m_iTotalPackets << " packets lost" << std::endl;
+
+    // PID-FIFO desync summary. Only logged when non-zero — healthy
+    // deployments produce nothing (avoids log spam). Real-time
+    // first-occurrence warnings are emitted from PushPid/PopPid in
+    // CVocodecChannel; this is the per-stream cumulative summary.
+    if ( totalOrphanDrops > 0 || totalOverflowDrops > 0 )
+    {
+        std::cout << "PID FIFO desync summary: "
+                  << totalOrphanDrops << " orphan drops, "
+                  << totalOverflowDrops << " overflow drops"
+                  << std::endl;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
