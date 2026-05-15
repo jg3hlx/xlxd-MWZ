@@ -157,15 +157,35 @@ void CYsfProtocol::RxTask(void)
                     g_Reflector.ReleaseClients();
                 }
 
-                // node linked and callsign muted?
-                if ( isPeer || g_GateKeeper.MayTransmit(Header->GetMyCallsign(), Ip, PROTOCOL_YSF, clientModule) )
+                // Peer traffic bypasses MayTransmit (peers are trusted
+                // interlinks, not subject to whitelist/blacklist/
+                // callsign-validity checks) but is still subject to
+                // the per-callsign loop block — without that, a
+                // peer-sourced echo loop on a single user callsign
+                // would never be stopped (MW0MWZ/xlxd production
+                // observation, May 2026). Non-peer traffic continues
+                // through the regular MayTransmit gate, which itself
+                // consults the loop block via IsLoopSuppressed.
+                if ( isPeer )
                 {
-                    // handle it
-                    OnDvHeaderPacketIn(Header, Ip);
+                    if ( g_GateKeeper.IsCallsignLoopBlocked(
+                            Header->GetMyCallsign(), "YSF peer") )
+                    {
+                        delete Header;
+                        Header = NULL;
+                    }
                 }
-                else
+                else if ( !g_GateKeeper.MayTransmit(
+                            Header->GetMyCallsign(), Ip,
+                            PROTOCOL_YSF, clientModule) )
                 {
                     delete Header;
+                    Header = NULL;
+                }
+
+                if ( Header != NULL )
+                {
+                    OnDvHeaderPacketIn(Header, Ip);
                 }
             }
             else if ( IsValidDvLastFramePacket(Ip, Fich, Buffer, Frames) )

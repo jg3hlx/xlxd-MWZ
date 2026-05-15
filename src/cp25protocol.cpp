@@ -276,15 +276,18 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
     // ~180 ms throughout the transmission, so LDU1_VOICE1 fires every
     // 360 ms even mid-transmission. Allocating a fresh sid on every
     // LDU1_VOICE1 (the previous behaviour) cut a single P25
-    // transmission into many 18-frame substreams — each new sid opened
-    // a new xlxd stream, expired without a TDU, tripped the per-source
-    // loop detector after 3 strikes, and ultimately blocked TX for
-    // 300 s. So allocate ONLY when there is no active mapping for this
-    // source (true start-of-transmission); otherwise reuse the
-    // existing mapping (mid-transmission LDU1 cycle). The mapping is
-    // released by OnTerminatorPacketIn when the TDU arrives, so the
-    // next LDU1_VOICE1 after a TDU is correctly recognised as a new
-    // transmission.
+    // transmission into many short substreams — each new sid opened
+    // a new xlxd stream that expired without a TDU. That spammed the
+    // gatekeeper's strike-based loop-detector log line on every
+    // physical transmission. (Note: that strike accumulation does
+    // NOT actually block P25 TX — see the IsCallsignLoopBlocked
+    // check on header construction below, which is what enforces
+    // the block for P25 today.) So allocate ONLY when there is no
+    // active mapping for this source (true start-of-transmission);
+    // otherwise reuse the existing mapping (mid-transmission LDU1
+    // cycle). The mapping is released by OnTerminatorPacketIn when
+    // the TDU arrives, so the next LDU1_VOICE1 after a TDU is
+    // correctly recognised as a new transmission.
     uint32 uiStreamId;
     if ( cmd == P25_REC_LDU1_VOICE1 && !HasActiveStreamIdForSource(Ip) )
     {
@@ -390,6 +393,34 @@ void CP25Protocol::OnLduPacketIn(const CBuffer &Buffer, const CIp &Ip, bool isFi
                 std::lock_guard<std::mutex> lock(m_StreamsCache[iModId].m_Mutex);
                 pendingCopy.swap(m_StreamsCache[iModId].m_PendingFrames);
                 m_StreamsCache[iModId].m_bPendingHeader = false;
+            }
+
+            // Per-callsign loop block. P25 has no MayTransmit call in
+            // its path (peer-only protocol, peer link is trusted), so
+            // this is the sole enforcement point. Without it the
+            // gatekeeper's strike accumulation for P25 is dead state.
+            // Synthetic callsigns from P25IdToCallsign / the "P<TG>"
+            // fallback are stable per-source, so the strike-counter
+            // and per-callsign map work the same as for YSF/NXDN.
+            if ( g_GateKeeper.IsCallsignLoopBlocked(csMY, "P25 peer") )
+            {
+                // Drop header, pending frames (already swapped out of
+                // m_PendingFrames), and the current Voice5 frame.
+                //
+                // Release the per-source stream-id mapping so the next
+                // LDU1_VOICE1 from this source re-allocates a fresh
+                // SID and re-enters this code path (rather than taking
+                // the LookupStreamIdForSource branch and feeding
+                // frames into OnDvFramePacketIn with no open stream,
+                // which would orphan them silently). On block expiry,
+                // the first LDU after the expiry then opens cleanly.
+                ReleaseStreamIdForSource(Ip);
+                delete header;
+                for (size_t i = 0; i < pendingCopy.size(); i++)
+                {
+                    delete pendingCopy[i];
+                }
+                return;
             }
 
             OnDvHeaderPacketIn(header, Ip);

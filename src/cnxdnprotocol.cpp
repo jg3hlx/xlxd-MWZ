@@ -97,6 +97,15 @@ void CNxdnProtocol::RxTask(void)
                 // Deferred call for OnDvLastFramePacketIn (must be called without peers lock
                 // because it calls HandleQueue which tries to acquire peers lock again)
                 CDvLastFramePacket *deferredLastFrame = NULL;
+                // Deferred call for OnDvHeaderPacketIn so the per-callsign
+                // loop-block check (IsCallsignLoopBlocked → LoopMutex)
+                // happens AFTER we release Peers. Avoids introducing a
+                // novel Peers → LoopMutex ordering that no other code
+                // path uses. The deferred values are captured under the
+                // Peers lock and consumed below the ReleasePeers call.
+                CDvHeaderPacket *deferredHeader = NULL;
+                uint16_t deferredSrcId = 0;
+                uint16_t deferredDstId = 0;
 
                 // find the peer
                 CPeers *peers = g_Reflector.GetPeers();
@@ -176,8 +185,12 @@ void CNxdnProtocol::RxTask(void)
                         // create header packet
                         CDvHeaderPacket *header = new CDvHeaderPacket(csMY, CCallsign("CQCQCQ"), rpt1, rpt2, uiStreamId, 0);
 
-                        // handle it (no gatekeeper check needed - already inside peer block)
-                        OnDvHeaderPacketIn(header, Ip, uiSrcId, uiDstId);
+                        // Defer OnDvHeaderPacketIn — the per-callsign loop
+                        // block check happens after Peers is released.
+                        // See the deferredHeader declaration above.
+                        deferredHeader = header;
+                        deferredSrcId = uiSrcId;
+                        deferredDstId = uiDstId;
                     }
                     else if ( uiFlags & NXDN_FLAG_TRAILER )
                     {
@@ -244,6 +257,29 @@ void CNxdnProtocol::RxTask(void)
                     }
                 }
                 g_Reflector.ReleasePeers();
+
+                // Process the deferred header outside Peers. Peer traffic
+                // bypasses MayTransmit by design, but is still subject
+                // to the per-callsign loop block. NXDN has no equivalent
+                // of the isPeer || MayTransmit check in YSF / DCS / etc.
+                // because this entire branch only runs when peer != NULL
+                // — so EVERY incoming NXDN header is peer-sourced and
+                // needs the loop-block consultation. See cysfprotocol.cpp
+                // for the rationale.
+                if ( deferredHeader != NULL )
+                {
+                    if ( g_GateKeeper.IsCallsignLoopBlocked(
+                            deferredHeader->GetMyCallsign(), "NXDN peer") )
+                    {
+                        delete deferredHeader;
+                        deferredHeader = NULL;
+                    }
+                    else
+                    {
+                        OnDvHeaderPacketIn(deferredHeader, Ip,
+                                           deferredSrcId, deferredDstId);
+                    }
+                }
 
                 // Now call OnDvLastFramePacketIn after peers lock is released
                 // This is necessary because OnDvLastFramePacketIn calls HandleQueue

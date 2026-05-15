@@ -119,7 +119,27 @@ void CDcsProtocol::RxTask(void)
                     g_Reflector.ReleasePeers();
                 }
 
-                if ( isPeer || g_GateKeeper.MayTransmit(Header->GetMyCallsign(), Ip, PROTOCOL_DCS, Header->GetRpt2Module()) )
+                // Peer traffic bypasses MayTransmit by design, but is
+                // still subject to the per-callsign loop block — see
+                // cysfprotocol.cpp for the rationale. Drop both Header
+                // and Frame atomically if the gate rejects.
+                bool dropPacket = false;
+                if ( isPeer )
+                {
+                    if ( g_GateKeeper.IsCallsignLoopBlocked(
+                            Header->GetMyCallsign(), "DCS peer") )
+                    {
+                        dropPacket = true;
+                    }
+                }
+                else if ( !g_GateKeeper.MayTransmit(
+                            Header->GetMyCallsign(), Ip,
+                            PROTOCOL_DCS, Header->GetRpt2Module()) )
+                {
+                    dropPacket = true;
+                }
+
+                if ( !dropPacket )
                 {
                     // capture DCS text field (bytes 62-99) for outgoing packet reconstruction
                     if ( Buffer.size() >= 100 )
